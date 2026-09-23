@@ -7,13 +7,20 @@ llama-swap に「1 リクエスト 1 行の JSONL を書き出す write-only の
 既存の in-memory capture ring（`captureBuffer` / `/api/captures/{id}`）、メトリクス、
 activity 行の挙動は変えていない（根拠は §4）。
 
+**2026-09-23 改訂（第 2 版）**: 出口を「平文 1 ファイル / FIFO」から
+**「ディレクトリに zstd 圧縮 ＋ サイズでローテーション」** に変えた。FIFO 出力は廃止
+（設定の `path` を `dir` / `maxFileBytes` / `level` に置換）。外部分割器（`s6-log`）を
+使う計画は取りやめ、圧縮とローテーションを llama-swap 自身が持つ。
+影響する節は §1・§2.2・§2.3・§3・§6・§8。それ以外（レコードの中身・emit 箇所・
+`cf` マスク・`outcome` の 4 値）は第 1 版のまま。
+
 ## 1. 触ったファイル
 
 | ファイル | 変更 |
 |---|---|
-| `internal/server/capturelog.go` | 新規。sink 本体（writer goroutine・レコード組み立て・符号化） |
-| `internal/server/capturelog_test.go` | 新規。13 テスト（うち 2 本は 2 subtest） |
-| `internal/server/capturelog_fifo_test.go` | 新規。FIFO テスト（`//go:build unix`） |
+| `internal/server/capturelog.go` | 新規。sink 本体（writer goroutine・zstd ファイル・ローテーション・レコード組み立て・符号化） |
+| `internal/server/capturelog_test.go` | 新規。17 テスト（うち 2 本は 2 subtest） |
+| ~~`internal/server/capturelog_fifo_test.go`~~ | 第 2 版で削除（FIFO 出力の廃止に伴い） |
 | `internal/server/metrics.go` | `captureLog` フィールド／`attachCaptureLog`／`wantsRequestCapture`／`Close`／`record` 内の 5 箇所の emit／`successOutcome` |
 | `internal/server/metrics_middleware.go` | 1 行。リクエスト本文の buffering 条件を `mm.enableCaptures` → `mm.wantsRequestCapture()` |
 | `internal/server/server.go` | `attachCaptureLog` の配線、`Server.Shutdown` から `metrics.Close()` |
@@ -26,9 +33,11 @@ activity 行の挙動は変えていない（根拠は §4）。
 
 ```yaml
 captureLog:
-  enabled: false          # 既定 false
-  path: ""                # 通常ファイルでも FIFO でもよい
-  includeAborted: false   # 既定 false。true なら 499 も 1 行
+  enabled: false                       # 既定 false
+  dir: /var/log/llama-swap/captures    # 出力先ディレクトリ（無ければ作る）
+  maxFileBytes: 268435456              # 圧縮後がこれを超えたらローテーション（既定 256 MiB）
+  level: 3                             # zstd レベル。省略時は klauspost の既定
+  includeAborted: false                # 既定 false。true なら 499 も 1 行
 ```
 
 ## 2. 設計判断
@@ -49,32 +58,46 @@ captureLog:
 3. 非 200 の呼び出し（`:223`）は `body` に `nil` を渡す。**sink が残したい失敗応答の本文は
    呼び出し側の `decoded` にしか無い。**
 
-### 2.2 FIFO — 「遅延オープン」ではなく「別 goroutine での blocking open」
+### 2.2 出力先はディレクトリ、圧縮とローテーションは自前（第 2 版）
 
-FIFO を書き込みで open すると読み手が付くまで block する（`open(2)`）。起動時に開くと
-読み手が居ないと起動できない。採った形は:
+第 1 版の FIFO 出力（読み手が付くまで `open(2)` が block する前提の別 goroutine
+blocking open、`O_NONBLOCK` を使わない理由、EPIPE の扱い）は**廃止した**。
+現在の形は:
 
-- sink は**専用の writer goroutine を 1 本持ち、その goroutine の中で blocking open する**。
-  起動パス（`attachCaptureLog`）は goroutine を起こして即 return するので、決して block しない。
-  読み手が付くまでのレコードは容量 1024 の channel に溜まり、付いた瞬間に流れ出す。
-  溢れたら**ドロップして警告**（リクエストは絶対に待たせない）。
-- **`O_NONBLOCK` は使わない。** open だけ non-blocking にしても fd に `O_NONBLOCK` が残り、
-  以後の write も non-blocking になる。FIFO への non-blocking write は `PIPE_BUF` (4096) を
-  超えると**部分書き込みし得る**ので、JSON 行が途中で切れて次の行と繋がる。これを避けるには
-  open 後に `fcntl(2)` で `O_NONBLOCK` を落とす必要があるが、Windows ビルドに移植できない。
-  blocking open + blocking write + 単一 goroutine なら、行は常に丸ごと 1 回の `Write` で出る。
-- 理由はコード中のコメント（`capturelog.go` の `open()` の doc comment）にも残してある。
+- 設定は `dir`（ディレクトリ。無ければ `MkdirAll`）。ファイルは
+  `captures-<timestamp>.jsonl.zst`（timestamp は Go の `20060102T150405Z0700`）。
+  **名前は open した時点で確定し、rename しない。** 同じ秒に 2 本開く場合は
+  `_001` …（ゼロ埋め）の接尾辞。`'_' > '.'` なので、**接尾辞なしの名前がその秒の先頭に来て、
+  以後は連番順**に並ぶ＝ ls / glob の順序がそのまま書いた順序になる。open は `O_EXCL` なので
+  stat→create の競合が無い。
+- 圧縮は `github.com/klauspost/compress/zstd`（既に直接依存、`captures.go` が使用）。
+  **`WithEncoderConcurrency(1)`**: writer goroutine が 1 本でファイルとエンコーダを
+  単独所有する不変条件を保つ＋実測スループットが 1 MB/s を大きく下回るため単スレッドで
+  3 桁の余裕がある。既定（GOMAXPROCS）だとファイルごとにブロックワーカーの pool が立つ。
+- **レコードごとに `Flush()`**。(a) プロセスが落ちても直前のレコードまで展開できる。
+  (b) 圧縮後バイト数が正確に分かり、ローテーション判定がぶれない（flush しないと
+  エンコーダ内部に溜まりファイルサイズが遅れて追従する）。1 レコードは数百 KB なので
+  flush 境界による圧縮率の劣化は無視できる。
+- **ローテーション時にエンコーダを `Close()`** してフレームを閉じる。切り出された 1 本 1 本が
+  単独で `zstd -d` できる完全なストリーム。**辞書（`--train`）も差分（`--patch-from`）も
+  使わない** — 実測で辞書は独立圧縮に負け、差分は復号時に依存の鎖を作るため。
+- 閾値（`maxFileBytes`）は**圧縮後バイト数**で、レコードを書いて flush した後に判定する。
+  レコードの途中では切らないので、実サイズは**閾値 ＋ 最後の 1 レコード**まで伸びる
+  （ハードな上限ではない）。この性質はコード・schema・KB ガイド・config 例に明記した。
+- **削除（世代上限）は実装しない。** 保管側の方針が「コピーのみ・削除しない」なので、
+  `n` 相当のパラメータを作っていない。
 
-**行が混ざらない根拠**もここ: 符号化済みの 1 行を channel 越しに渡し、**ファイルを所有する
-goroutine は 1 本だけ**。並行リクエストが同じ fd に同時に書くことがない。
+**行が混ざらない根拠**は第 1 版と同じ: 符号化済みの 1 行を channel 越しに渡し、
+**ファイルとエンコーダを所有する goroutine は 1 本だけ**。並行リクエストが同じ
+fd / エンコーダに同時に触ることがない。
 
-### 2.3 再オープンしない
+### 2.3 閉じたファイルは開き直さない
 
-ローテーション用の再オープン（SIGHUP 等）は実装していない。外部ローテータが FIFO の
-読み手として受ける前提。**書き込みエラー（読み手が消えた場合の EPIPE を含む）でも
-再オープンしない** — 1 回だけ警告を出して以後は黙って捨てる。ファイルを裏で rename する
-ローテータに対しては、再オープンしない方が（rotate 後の inode に書き続けるより）まだ正直。
-この判断もコードのコメントと KB ガイドに書いてある。
+ローテーションで閉じたファイルは**二度と開かない・rename しない・名前を再利用しない**。
+だから「最新でないファイル」は確定済みで、外部のコピー元として安全に扱える。
+書き込みエラーは 1 回だけ警告して以後は黙って捨てる（リクエストは壊さない）。
+open 自体に失敗した場合は `broken` を立てて以後リトライしない（書けないディレクトリが
+走行中に書けるようになることは無く、レコードごとのリトライはログを埋めるだけ）。
 
 ### 2.4 本文は verbatim
 
@@ -181,10 +204,15 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
 
 - `Server.Shutdown`（`server.go`）の末尾、`wg.Wait()` の後に `s.metrics.Close()` を足した。
   これで dead code だった `metricsMonitor.Close()` が生きる。`Close` は sink に quit を送り、
-  **既に queue に載っている行を drain してからファイルを閉じる**。
-- `Close` は最大 3 秒しか待たない。**読み手の付かない FIFO では writer が `open(2)` で
-  永久に止まり得る**ので、shutdown がそれを相続しないようにした（その場合は
-  「開けていない＝flush するものが無い」ので捨ててよい）。警告は出る。
+  **既に queue に載っている行を drain し、開いているファイルの zstd フレームを閉じてから
+  ファイルを閉じる**。
+- **`Close` の待ちは無制限にした**（第 1 版の 3 秒 timeout は削除）。timeout の理由だった
+  「読み手の付かない FIFO で writer が `open(2)` に永久に park し得る」は FIFO 廃止で
+  消滅し、writer が block し得るのは通常ファイルへの write だけになった。逆に
+  **最後のフレームを閉じられるのは Close だけ**なので、ここで打ち切る方が害が大きい。
+- Close されずにプロセスが死んだ場合は、最後のファイルがフレーム未終端（epilogue 無し）
+  になる。レコードごとに flush しているので**そこまでのレコードは展開でき**、復号器は
+  末尾で unexpected EOF を報告する（`TestCaptureLog_UnclosedFileReadsToLastFlush`）。
 - 書き込み失敗でリクエスト処理は壊れない。`write` は non-blocking（channel が満杯なら
   ドロップ + 警告）、ファイル write のエラーは 1 回だけ警告して続行。
   encode 失敗も警告して 1 行捨てるだけ。
@@ -240,21 +268,24 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
    既存の redaction をそのまま通しただけで、sink 側で足していない。
    ただし sink はリクエスト／レスポンス本文を全部保存するので、
    **ring より機微情報の露出面は明確に大きい**。出力先のパーミッションは運用側の責任。
-4. **`captureLog.enabled: true` かつ `path: ""` は起動エラーにせず、警告を出して無効化**
-   している（`load.go` の検証に手を入れると blast radius が広がるため）。
-   起動時に落としたいなら `load.go` 側に移す。
+4. **`captureLog.enabled: true` かつ `dir: ""`（および `MkdirAll` の失敗）は起動エラーに
+   せず、警告を出して無効化**している（`load.go` の検証に手を入れると blast radius が
+   広がるため）。起動時に落としたいなら `load.go` 側に移す。
 5. **`docs/` と `config-schema.json` にも手を入れた。** 指示書には無かったが、
    リポジトリの `AGENTS.md` が「設定オプションを足したら `docs/kb/guides/` と
    `config.example.yaml` と `config-schema.json` を更新せよ」と要求しているため。
    `config.example.yaml` へはコメントアウトした形で入れた（`# store:` と同じ扱い。
    `internal/docagent/golden_test.go` の section 一覧を触らずに済む）。不要なら落とせる。
-6. **`Close` の 3 秒**（`captureLogCloseTimeout`）と **queue 深さ 1024**
-   （`captureLogQueueDepth`）は根拠のある実測値ではなく、設計上の既定値。
+6. **queue 深さ 1024**（`captureLogQueueDepth`）と **既定閾値 256 MiB**
+   （`captureLogDefaultMaxFileBytes`）は根拠のある実測値ではなく、設計上の既定値。
+   第 1 版にあった `captureLogCloseTimeout`（3 秒）は第 2 版で削除した（§3）。
+7. **同一秒の連番は 3 桁ゼロ埋め**で、`captureLogMaxNameSeq = 1000` に達すると
+   open がエラーになる（= sink が止まる）。桁が増えると名前が open 順に並ばなくなるため
+   そこで切っている。1 秒に 1000 本ローテーションする設定は誤設定の域。
 
 ## 6. テスト
 
-`internal/server/capturelog_test.go`（13 本、うち 2 本は 2 subtest）と
-`capturelog_fifo_test.go`（1 本）。
+`internal/server/capturelog_test.go`（17 本、うち 2 本は 2 subtest）。
 指示書が求めた 6 本は以下:
 
 | 指示書の要求 | テスト |
@@ -266,10 +297,10 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
 | 不正な UTF-8 が base64 に | `TestCaptureLog_InvalidUTF8IsBase64` |
 | 並行リクエストで行が混ざらない | `TestCaptureLog_ConcurrentRequestsDoNotInterleave` |
 
-並行テストは 24 並列・本文それぞれ 32 KiB（`PIPE_BUF` の 8 倍）で、行が混ざれば
+並行テストは 24 並列・本文それぞれ 32 KiB で、行が混ざれば
 JSON の parse が壊れるか marker が食い違う形にしてある。
 
-追加した 5 本（指示書の要求ではないが、設計の要を固定するもの）:
+追加した 4 本（指示書の要求ではないが、設計の要を固定するもの）:
 
 - `TestCaptureLog_MidStreamDisconnect` — 200 のまま切れた SSE が
   `client_disconnected_mid_stream` になる（塞いだ穴そのもの）
@@ -277,9 +308,6 @@ JSON の parse が壊れるか marker が食い違う形にしてある。
 - `TestCaptureLog_AbortedRequest`（2 subtest）— 499 は既定で出ない／
   `includeAborted: true` で req のみ 1 行
 - `TestCaptureLog_RedactsSensitiveHeaders` — 既存の redaction を通っている
-- `TestCaptureLog_FIFOTargetDoesNotBlock` — FIFO を読み手なしで指定しても
-  attach も `record` も block しない。**レコードを先に積んでから読み手を付けて**、
-  その 1 行が流れてくることを確認する
 
 裁定（2026-09-23）で追加した 3 本:
 
@@ -300,6 +328,41 @@ JSON の parse が壊れるか marker が食い違う形にしてある。
 
 既存 11 本のうち body を読む箇所は、`Body` が `*string` になったのに伴い
 テスト側の `captureLogPayload.body()` ヘルパ経由に書き換えた（判定内容は不変）。
+
+第 2 版（zstd ＋ ローテーション）で追加した 4 本:
+
+| 要求 | テスト |
+|---|---|
+| 閾値を小さくして複数ファイルが生成される／各ファイルが単独で展開できる／全ファイルを展開して連結したものが書き込んだレコード列とバイト一致／各行が JSON として妥当 | `TestCaptureLog_RotationKeepsEveryByte` |
+| リクエスト経路からもローテーションが起き、順序が保たれる | `TestCaptureLog_RotatesAcrossRequests` |
+| `Close()` されずに終わっても flush 済みレコードまで展開できる | `TestCaptureLog_UnclosedFileReadsToLastFlush` |
+| 同一秒でも名前が衝突せず、名前が open 順に並ぶ | `TestCaptureLog_NamesAreUniqueAndSorted` |
+
+- `RotationKeepsEveryByte` は `newCaptureLogWriter` に直接 4 KiB のランダム hex を
+  含むレコードを 24 本渡し（`captureLogQueueDepth` の 1024 より十分少ないのでドロップ 0 を
+  検査）、閾値 1 KiB で複数ファイルに割る。各ファイルは**その都度新しい `zstd.Decoder`**
+  で開く（辞書も前のファイルも視界に無いので、自己完結でなければ失敗する）。
+- テスト側のヘルパ（`captureLogFiles` / `decodeCaptureLogFile` / `readCaptureLogBytes`）は
+  「ディレクトリ内の全ファイルを名前順に展開して連結」を担い、既存 13 本はこの経路に
+  載せ替えただけで判定内容は不変。
+- 第 2 版で削除: `capturelog_fifo_test.go`（`TestCaptureLog_FIFOTargetDoesNotBlock`）。
+
+### 6.1 外部オラクル（zstd CLI）での確認
+
+Go の decoder だけでなく **zstd CLI 1.5.7（`nix shell nixpkgs#zstd`）** で同じ主張を取った。
+一時テストで 12 本のファイル（閾値 1 KiB・level 3）を吐かせて:
+
+```
+$ zstd -t captures-20260923T123819+0900.jsonl.zst
+captures-20260923T123819+0900.jsonl.zst: 8466 bytes
+$ zstd -t *.zst
+12 files decompressed : 101595 bytes total
+$ zstd -dc *.zst > joined.jsonl
+$ cmp joined.jsonl expected.jsonl && echo IDENTICAL
+IDENTICAL
+```
+
+（`expected.jsonl` は sink に渡した行をそのまま連結したもの。一時テストは削除済み。）
 
 ## 7. 出力例
 
@@ -327,9 +390,20 @@ go vet ./...                     # exit 0
 
 `nix run nixpkgs#go` でも代替可（ネットワークは到達する）。
 
-**`make test-dev` の 2 段目 `staticcheck ./...` は環境に staticcheck が無く走っていない**
-（Makefile が `|| true` にしているので exit 0 は保たれる）。
-`nix run nixpkgs#go-tools` の staticcheck 2026.2.1 は go1.26 ビルドで、
+**`make test-dev` の 2 段目 `staticcheck ./...` は環境に staticcheck が無く走らない**
+（`sh: line 1: staticcheck: command not found`。Makefile が `|| true` にしているので
+exit 0 は保たれる）。`nix run nixpkgs#go-tools` の staticcheck 2026.2.1 は go1.26 ビルドで、
 本リポジトリの go1.27 モジュールを解析できず全 package が
 `package requires newer Go version go1.27` で compile error になる。
-**したがって静的解析の結果は「緑」ではなく「未取得」**。代わりに `go vet ./...`（exit 0）を取った。
+
+**第 2 版で取得方法を見つけた**: go.mod と同じ go1.27.1 から staticcheck をビルドすれば
+バージョン差が出ない。
+
+```bash
+nix shell nixpkgs#go --command go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+```
+
+結果は **16 件、すべて上流由来**（`cmd/kubeswap` 3 / `cmd/vllm-wrapper` 2 /
+`internal/config/mcpprovider.go` 1 / `internal/perf` 9 / `internal/swaputil/http.go` 1）で、
+**capture sink が触った範囲（`internal/server/capturelog*.go` / `internal/config/config.go`）
+への指摘は 0 件**。上流由来の 16 件は直していない。

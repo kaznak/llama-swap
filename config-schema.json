@@ -233,11 +233,21 @@
                 "enabled": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Append one JSON object per metered request to captureLog.path."
+                    "description": "Write one JSON object per metered request into captureLog.dir."
                 },
-                "path": {
+                "dir": {
                     "type": "string",
-                    "description": "Destination file or FIFO. It is opened for appending on first use and never reopened; use a FIFO to hand the stream to an external rotator."
+                    "description": "Destination directory, created if missing. Files are named captures-<timestamp>.jsonl.zst and each is a complete, independently decompressible zstd stream; they are never renamed, reopened or deleted."
+                },
+                "maxFileBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 268435456,
+                    "description": "Start a new file once the current one reaches this many compressed bytes. Not a hard limit: a record is never split, so a file grows to this size plus its last record."
+                },
+                "level": {
+                    "type": "integer",
+                    "description": "zstd compression level, in zstd(1)'s numbering. Omit to use the compressor's default."
                 },
                 "includeAborted": {
                     "type": "boolean",
@@ -247,7 +257,7 @@
             },
             "additionalProperties": false,
             "default": {},
-            "description": "Write-only JSONL request/response log. Independent of captureBuffer; it never feeds /api/captures."
+            "description": "Write-only zstd-compressed JSONL request/response log. Independent of captureBuffer; it never feeds /api/captures."
         },
         "store": {
             "type": "object",

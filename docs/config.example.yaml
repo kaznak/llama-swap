@@ -63,17 +63,23 @@ metricsMaxInMemory: 1000
 # - set to 0 to disable
 captureBuffer: 15
 
-# captureLog: append one JSON object per metered request to a file or FIFO
+# captureLog: write one JSON object per metered request into a directory of
+# zstd-compressed, size-rotated files
 # - optional, disabled by default, independent of captureBuffer
 # - write-only: it never feeds the Activity page or /api/captures
 # - records what the in-memory captures drop: failed responses' bodies and
 #   clients that hang up part-way through a stream
-# - the path is opened for appending on first use and never reopened, so point
-#   it at a FIFO and let an external reader handle rotation
+# - dir is created if missing; files are captures-<timestamp>.jsonl.zst and
+#   each one decompresses on its own (zstd -d)
+# - maxFileBytes is measured on compressed bytes and is not a hard limit: a
+#   record is never split, so a file grows to that size plus its last record
+# - llama-swap never deletes old files; copy or remove them yourself
 # - includeAborted also logs requests abandoned before a response started (499)
 # captureLog:
 #   enabled: true
-#   path: /var/run/llama-swap/captures.fifo
+#   dir: /var/log/llama-swap/captures
+#   maxFileBytes: 268435456
+#   level: 3
 #   includeAborted: false
 
 # ui.activity.session_id: ordered request headers used to identify sessions in

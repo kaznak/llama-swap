@@ -120,16 +120,25 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
-// CaptureLogConfig configures the append-only JSONL request/response sink.
-// It is independent of captureBuffer: the sink is write-only and never feeds
-// the in-memory capture ring or /api/captures/{id}.
+// CaptureLogConfig configures the rotating, zstd-compressed JSONL
+// request/response sink. It is independent of captureBuffer: the sink is
+// write-only and never feeds the in-memory capture ring or
+// /api/captures/{id}.
 type CaptureLogConfig struct {
 	// Enabled turns the sink on. Default false.
 	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Path is the destination. A regular file is appended to; a FIFO is
-	// written to as-is, which is the supported way to hand the stream to an
-	// external rotator or shipper. llama-swap never reopens the path.
-	Path string `yaml:"path" json:"path"`
+	// Dir is the directory the sink writes into, created if missing. Files are
+	// named captures-<timestamp>.jsonl.zst, and each one is a complete,
+	// independently decompressible zstd stream. llama-swap never renames,
+	// reopens or deletes them.
+	Dir string `yaml:"dir" json:"dir"`
+	// MaxFileBytes rotates the current file once its compressed size reaches
+	// this many bytes. It is not a hard cap: a record is never split, so the
+	// file grows to this size plus its last record. Default 256 MiB.
+	MaxFileBytes int64 `yaml:"maxFileBytes" json:"maxFileBytes"`
+	// Level is the zstd compression level in zstd(1)'s numbering. Unset (0)
+	// leaves the compressor's own default.
+	Level int `yaml:"level" json:"level"`
 	// IncludeAborted also logs 499 client-closed requests (request only).
 	// Default false, matching the activity log, which records them but stores
 	// no capture (#1029).

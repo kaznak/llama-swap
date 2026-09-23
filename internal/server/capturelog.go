@@ -4,23 +4,29 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // The capture log is a write-only JSONL sink: one self-contained line per
-// metered request, appended to a regular file or a FIFO. It exists next to the
-// in-memory capture ring (captureBuffer, /api/captures/{id}) and never feeds
-// it: nothing here reads back, nothing here changes what the ring, the
-// activity row or the metrics record.
+// metered request, zstd-compressed into size-rotated files in a directory. It
+// exists next to the in-memory capture ring (captureBuffer,
+// /api/captures/{id}) and never feeds it: nothing here reads back, nothing
+// here changes what the ring, the activity row or the metrics record.
 //
 // It deliberately records three things the ring cannot:
 //
@@ -133,20 +139,157 @@ type captureLogRecord struct {
 }
 
 // captureLogQueueDepth is how many encoded lines may wait for the writer
-// goroutine. It absorbs a burst while a FIFO reader is slow or has not
-// attached yet; beyond it lines are dropped rather than blocking a request.
+// goroutine. It absorbs a burst while the writer is compressing or rotating;
+// beyond it lines are dropped rather than blocking a request.
 const captureLogQueueDepth = 1024
 
-// captureLogCloseTimeout bounds how long Shutdown waits for the writer to
-// drain. A FIFO with no reader can leave the writer parked in open(2) forever,
-// and shutdown must not inherit that wait.
-const captureLogCloseTimeout = 3 * time.Second
+// captureLogDefaultMaxFileBytes is the rotation threshold used when the
+// configuration gives none: 256 MiB of compressed output.
+const captureLogDefaultMaxFileBytes int64 = 256 << 20
 
-// captureLogWriter appends encoded records to path. A single goroutine owns
-// the file, which is what keeps concurrent requests from interleaving: every
-// line is handed over whole and written by one writer in one Write call.
+// captureLogFileTimeFormat stamps a file name with the local time the file was
+// opened. Basic ISO 8601, so the name needs no quoting in a shell.
+const captureLogFileTimeFormat = "20060102T150405Z0700"
+
+const (
+	captureLogFilePrefix = "captures-"
+	captureLogFileSuffix = ".jsonl.zst"
+)
+
+// captureLogMaxNameSeq bounds the search for a free name within one second.
+// It is also the point at which the zero-padded suffix would grow a digit and
+// stop sorting in open order, and reaching it means more than a thousand files
+// were rotated inside one second, which is a misconfiguration rather than
+// something to spin on.
+const captureLogMaxNameSeq = 1000
+
+// countingWriter counts the bytes that reach the file underneath the encoder.
+// The rotation threshold is measured on compressed output, and only the bytes
+// leaving the encoder say how large the file actually is, so the count is
+// taken here rather than with stat(2).
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// captureLogFile is one output file: a zstd stream over a regular file, plus
+// the number of compressed bytes already in it.
+//
+// Each file is a complete, independent zstd stream. It gets its own encoder
+// and is finished with close(), which writes the frame epilogue. Nothing is
+// shared across files — no trained dictionary, no delta against the previous
+// file — so any one file decompresses on its own (`zstd -d <file>`) without
+// the rest of the directory being present.
+type captureLogFile struct {
+	name    string
+	f       *os.File
+	counter *countingWriter
+	enc     *zstd.Encoder
+}
+
+// openCaptureLogFile creates the next file in dir. The name is fixed when the
+// file is created and never changes: there is no "current" symlink and no
+// rename on rotation, so a copier that picks up a finished file is never
+// looking at a path whose meaning changed underneath it.
+//
+// now is normally time.Now. Two files opened within the same second would
+// collide, so the later one takes a numeric suffix; O_EXCL makes that check
+// atomic instead of a stat-then-create race. The suffix is "_" plus a
+// zero-padded count, chosen so that a plain name still sorts before its own
+// collision suffixes ('_' > '.') and the suffixes sort among themselves: the
+// names in the directory are therefore in the order they were opened, which is
+// the order their records were written.
+//
+// level is the zstd compression level in zstd(1)'s numbering; 0 means "not
+// configured" and leaves the klauspost default in place.
+func openCaptureLogFile(dir string, level int, now time.Time) (*captureLogFile, error) {
+	stamp := now.Format(captureLogFileTimeFormat)
+	var f *os.File
+	var name string
+	for seq := 0; ; seq++ {
+		if seq >= captureLogMaxNameSeq {
+			return nil, fmt.Errorf("no free name for %s%s* in %s", captureLogFilePrefix, stamp, dir)
+		}
+		if seq == 0 {
+			name = captureLogFilePrefix + stamp + captureLogFileSuffix
+		} else {
+			name = fmt.Sprintf("%s%s_%03d%s", captureLogFilePrefix, stamp, seq, captureLogFileSuffix)
+		}
+		var err error
+		f, err = os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+
+	// One writer goroutine owns this encoder and the measured throughput of
+	// the sink is orders of magnitude below what a single zstd thread
+	// sustains, so the encoder is given exactly one. The library's default is
+	// GOMAXPROCS, which would start a pool of block workers per open file for
+	// no gain.
+	opts := []zstd.EOption{zstd.WithEncoderConcurrency(1)}
+	if level != 0 {
+		opts = append(opts, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)))
+	}
+	counter := &countingWriter{w: f}
+	enc, err := zstd.NewWriter(counter, opts...)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &captureLogFile{name: name, f: f, counter: counter, enc: enc}, nil
+}
+
+// write appends one encoded line and flushes it. The flush is per record on
+// purpose, for two reasons. A process that dies without closing the frame
+// still leaves every already-written record decompressible. And the byte count
+// stays exact: an unflushed record would sit inside the encoder and make the
+// file look smaller than it is when the rotation threshold is tested. A record
+// is hundreds of kilobytes, so what a flush boundary costs in ratio is noise.
+func (c *captureLogFile) write(line []byte) error {
+	if _, err := c.enc.Write(line); err != nil {
+		return err
+	}
+	return c.enc.Flush()
+}
+
+// bytes is the compressed size on disk, counting everything flushed so far.
+func (c *captureLogFile) bytes() int64 {
+	return c.counter.n
+}
+
+// close finishes the zstd frame and closes the file. Until this has run the
+// file is a truncated stream — readable up to the last flush, but without the
+// epilogue — which is why graceful shutdown has to reach it.
+func (c *captureLogFile) close() error {
+	encErr := c.enc.Close()
+	fErr := c.f.Close()
+	if encErr != nil {
+		return encErr
+	}
+	return fErr
+}
+
+// captureLogWriter appends encoded records to rotating files in dir. A single
+// goroutine owns the open file and its encoder, which is what keeps concurrent
+// requests from interleaving: every line is handed over whole and written by
+// that one writer.
 type captureLogWriter struct {
-	path           string
+	dir string
+	// maxFileBytes is the rotation threshold, tested on compressed bytes after
+	// a record is flushed. It is not a hard cap: records are never split, so a
+	// file grows to the threshold plus one last record.
+	maxFileBytes   int64
+	level          int
 	includeAborted bool
 	logger         *logmon.Monitor
 
@@ -165,21 +308,39 @@ type captureLogWriter struct {
 }
 
 // newCaptureLogWriter starts a capture log writer, or returns nil when the
-// sink is disabled or misconfigured (an enabled sink with no path is a
-// configuration mistake; it is reported and disabled rather than failing
-// startup, since the sink is an observability add-on).
+// sink is disabled or misconfigured (an enabled sink with no directory, or a
+// directory that cannot be created, is a configuration mistake; it is reported
+// and disabled rather than failing startup, since the sink is an
+// observability add-on).
+//
+// The directory is created here, on the startup path, so a bad setting is
+// reported immediately. The files inside it are opened lazily by the writer
+// goroutine, so an enabled sink that never sees a request leaves no empty
+// stream behind.
 func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor) *captureLogWriter {
 	if !cfg.Enabled {
 		return nil
 	}
-	if cfg.Path == "" {
+	if cfg.Dir == "" {
 		if logger != nil {
-			logger.Warn("captureLog.enabled is set but captureLog.path is empty; capture log disabled")
+			logger.Warn("captureLog.enabled is set but captureLog.dir is empty; capture log disabled")
 		}
 		return nil
 	}
+	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+		if logger != nil {
+			logger.Warnf("capture log %s: creating the directory failed: %v; capture log disabled", cfg.Dir, err)
+		}
+		return nil
+	}
+	maxFileBytes := cfg.MaxFileBytes
+	if maxFileBytes <= 0 {
+		maxFileBytes = captureLogDefaultMaxFileBytes
+	}
 	w := &captureLogWriter{
-		path:           cfg.Path,
+		dir:            cfg.Dir,
+		maxFileBytes:   maxFileBytes,
+		level:          cfg.Level,
 		includeAborted: cfg.IncludeAborted,
 		logger:         logger,
 		lines:          make(chan []byte, captureLogQueueDepth),
@@ -207,79 +368,77 @@ func (w *captureLogWriter) write(line []byte) {
 	case <-w.quit:
 	default:
 		if n := w.dropped.Add(1); n == 1 || n%1000 == 0 {
-			w.warnf("capture log %s: queue full, dropped %d record(s)", w.path, n)
+			w.warnf("capture log %s: queue full, dropped %d record(s)", w.dir, n)
 		}
 	}
 }
 
-// Close stops the writer and waits (briefly) for the queue to drain.
+// Close stops the writer and waits for it to drain the queue and finish the
+// zstd frame of whatever file it has open. The wait is deliberately unbounded:
+// closing the frame is the only thing that turns the newest file into a
+// complete stream, and the writer never blocks on anything but writes to a
+// regular file.
 func (w *captureLogWriter) Close() error {
 	if w == nil {
 		return nil
 	}
 	w.closeOnce.Do(func() { close(w.quit) })
-	select {
-	case <-w.done:
-	case <-time.After(captureLogCloseTimeout):
-		// Reached when the writer is still parked in open(2) on a FIFO that
-		// never got a reader. There is nothing to flush in that case — the
-		// file was never opened — so shutdown continues.
-		w.warnf("capture log %s: writer did not finish within %s, abandoning it", w.path, captureLogCloseTimeout)
-	}
+	<-w.done
 	return nil
 }
 
-// open opens the sink for appending.
+// run owns every file and encoder the sink opens; nothing else touches them.
+// That sole ownership is what keeps concurrent requests from interleaving — a
+// record is encoded by the caller, handed over whole, and written here.
 //
-// This runs on the writer goroutine, never on the startup path, and that is
-// the whole point: opening a FIFO for writing blocks until a reader attaches
-// (open(2), O_WRONLY on a FIFO). Opening it at startup would mean llama-swap
-// could not start until someone was reading the log. Here the block is
-// harmless — the server is already serving, and records queue in w.lines until
-// the reader shows up.
+// Rotation is by size, measured on compressed bytes after each record is
+// flushed, and it closes the frame before starting the next file. A record is
+// never split across files, so a file ends up at the threshold plus its last
+// record.
 //
-// The open is blocking rather than O_NONBLOCK on purpose. A non-blocking FIFO
-// fd makes every later write non-blocking too, and a non-blocking write larger
-// than PIPE_BUF can write only part of a record, which would splice half a
-// JSON line into the stream. Clearing O_NONBLOCK afterwards needs fcntl(2),
-// which is not portable to the Windows build. Blocking writes from a single
-// goroutine keep each record whole.
-//
-// There is deliberately no reopen: no SIGHUP handler, no retry after a write
-// error. Log rotation is the external reader's job (point the sink at a FIFO
-// and let the rotator read from it); a rotator that renames the file underneath
-// us would silently write to the rotated inode, which is worse than not
-// supporting rotation at all. If the FIFO's reader goes away the writes start
-// failing with EPIPE and the sink stops until llama-swap is restarted.
-func (w *captureLogWriter) open() (*os.File, error) {
-	return os.OpenFile(w.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-}
-
+// There is no reopen of a file once it is closed and no reuse of a name: a
+// finished file is finished, which is what makes it safe for an external
+// copier to pick up. Deletion of old files is deliberately not implemented —
+// retention belongs to whatever copies them away.
 func (w *captureLogWriter) run() {
 	defer close(w.done)
 
-	f, err := w.open()
-	if err != nil {
-		w.warnf("capture log %s: open failed: %v; capture log disabled for this run", w.path, err)
-		// Keep draining so write() stays non-blocking and the queue does not
-		// pin dropped records in memory.
-		for {
-			select {
-			case <-w.lines:
-			case <-w.quit:
-				return
-			}
-		}
-	}
+	var cur *captureLogFile
+	// broken latches when a file cannot be opened at all. The loop keeps
+	// draining afterwards so write() stays non-blocking and the queue does not
+	// pin dropped records in memory, but nothing is retried: a directory that
+	// cannot be written to will not start working mid-run, and retrying per
+	// record would fill the proxy log.
+	broken := false
 	defer func() {
-		if err := f.Close(); err != nil {
-			w.warnf("capture log %s: close failed: %v", w.path, err)
+		if cur != nil {
+			if err := cur.close(); err != nil {
+				w.warnf("capture log %s: closing %s failed: %v", w.dir, cur.name, err)
+			}
 		}
 	}()
 
 	emit := func(line []byte) {
-		if _, err := f.Write(line); err != nil && w.warned.CompareAndSwap(false, true) {
-			w.warnf("capture log %s: write failed: %v; further write errors are not reported", w.path, err)
+		if broken {
+			return
+		}
+		if cur == nil {
+			f, err := openCaptureLogFile(w.dir, w.level, time.Now())
+			if err != nil {
+				w.warnf("capture log %s: open failed: %v; capture log disabled for this run", w.dir, err)
+				broken = true
+				return
+			}
+			cur = f
+		}
+		if err := cur.write(line); err != nil && w.warned.CompareAndSwap(false, true) {
+			w.warnf("capture log %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
+		}
+		if cur.bytes() >= w.maxFileBytes {
+			if err := cur.close(); err != nil {
+				w.warnf("capture log %s: closing %s failed: %v", w.dir, cur.name, err)
+			}
+			cur = nil
 		}
 	}
 

@@ -24,18 +24,20 @@ captureBuffer: 100
 Do not put secrets in captures or debug logs. Reduce retention after diagnosing
 an issue.
 
-## Streaming every request to a file
+## Recording every request to disk
 
 `captureBuffer` keeps recent captures in memory for the Activity page, so old
 requests fall out of the ring and failed responses keep only an error message.
-When you need the full history instead, enable `captureLog`: it appends one
-self-contained JSON object per metered request, independent of
-`captureBuffer`.
+When you need the full history instead, enable `captureLog`: it writes one
+self-contained JSON object per metered request into a directory of
+zstd-compressed files, independent of `captureBuffer`.
 
 ```yaml
 captureLog:
   enabled: true
-  path: /var/run/llama-swap/captures.fifo
+  dir: /var/log/llama-swap/captures
+  maxFileBytes: 268435456
+  level: 3
   includeAborted: false
 ```
 
@@ -50,12 +52,22 @@ llama-swap does not store those in the capture ring either. Their lines carry
 `"body": null` with `body_omitted: "route_policy"` and `body_bytes`, so a line
 never looks like a request that had no body.
 
-`path` may be a regular file or a FIFO. llama-swap opens it once and never
-reopens it, so rotating the file underneath it silently writes to the rotated
-inode: point it at a FIFO and let the reader on the other end rotate or ship
-the stream. Set `includeAborted: true` to also record requests the client
-abandoned before a response started (HTTP 499); those lines carry the request
-only.
+`dir` is created if missing. Files are named
+`captures-<timestamp>.jsonl.zst`, the name is fixed when the file is created,
+and llama-swap never renames or reopens one: a file that is no longer the
+newest is finished and safe to copy away. Each file is a complete zstd stream
+on its own, so `zstd -d captures-20260923T123000+0900.jsonl.zst` works without
+the rest of the directory, and the names sort in the order they were written,
+so `zstd -dc captures-*.jsonl.zst` replays the whole history in order.
+
+`maxFileBytes` is measured on compressed bytes, checked after each record, and
+is not a hard limit: a record is never split across files, so a file grows to
+`maxFileBytes` plus its last record. `level` is the zstd compression level in
+`zstd(1)`'s numbering; omit it for the default. llama-swap never deletes old
+files — retention is yours to run, by copying them elsewhere or removing them.
+
+Set `includeAborted: true` to also record requests the client abandoned before
+a response started (HTTP 499); those lines carry the request only.
 
 The sink holds full request and response bodies, so it inherits the warning
 above with more force: write it somewhere only operators can read, and turn it
