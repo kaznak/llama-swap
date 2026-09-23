@@ -63,6 +63,19 @@ metricsMaxInMemory: 1000
 # - set to 0 to disable
 captureBuffer: 15
 
+# captureLog: append one JSON object per metered request to a file or FIFO
+# - optional, disabled by default, independent of captureBuffer
+# - write-only: it never feeds the Activity page or /api/captures
+# - records what the in-memory captures drop: failed responses' bodies and
+#   clients that hang up part-way through a stream
+# - the path is opened for appending on first use and never reopened, so point
+#   it at a FIFO and let an external reader handle rotation
+# - includeAborted also logs requests abandoned before a response started (499)
+# captureLog:
+#   enabled: true
+#   path: /var/run/llama-swap/captures.fifo
+#   includeAborted: false
+
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.
 # - optional, default: ["X-Session-ID", "X-Litellm-Session-Id"]

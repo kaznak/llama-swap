@@ -120,6 +120,22 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
+// CaptureLogConfig configures the append-only JSONL request/response sink.
+// It is independent of captureBuffer: the sink is write-only and never feeds
+// the in-memory capture ring or /api/captures/{id}.
+type CaptureLogConfig struct {
+	// Enabled turns the sink on. Default false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Path is the destination. A regular file is appended to; a FIFO is
+	// written to as-is, which is the supported way to hand the stream to an
+	// external rotator or shipper. llama-swap never reopens the path.
+	Path string `yaml:"path" json:"path"`
+	// IncludeAborted also logs 499 client-closed requests (request only).
+	// Default false, matching the activity log, which records them but stores
+	// no capture (#1029).
+	IncludeAborted bool `yaml:"includeAborted" json:"includeAborted"`
+}
+
 type UIConfig struct {
 	Activity UIActivityConfig `yaml:"activity" json:"activity"`
 }
@@ -160,6 +176,7 @@ type Config struct {
 	LogToStdout        string            `yaml:"logToStdout"`
 	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
 	CaptureBuffer      int               `yaml:"captureBuffer"`
+	CaptureLog         CaptureLogConfig  `yaml:"captureLog"`
 	Store              *Store            `yaml:"store"`
 	UI                 UIConfig          `yaml:"ui"`
 	Performance        PerformanceConfig `yaml:"performance"`

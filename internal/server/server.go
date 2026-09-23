@@ -252,6 +252,11 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	}
 	s.capcompat = capcompat.New(st.Cache(), proxylog)
 	s.capcompatCancel = event.On(s.onProcessStateChange)
+	// The JSONL capture sink is attached after construction rather than
+	// threaded through newMetricsMonitor so the monitor's existing signature
+	// (and every caller of it) stays as it is. Its writer goroutine is
+	// released by Server.Shutdown via metricsMonitor.Close.
+	s.metrics.attachCaptureLog(cfg.CaptureLog)
 
 	// SysProvider is constructed here because this is where perf and hardware
 	// are in scope; wiring those in later is a change to internal/mcptools.
@@ -550,5 +555,16 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	}
 
 	wg.Wait()
+
+	// The metrics monitor is closed last: record() runs after each handler
+	// returns, so its capture-log lines are only all queued once inflight
+	// requests have drained (which Shutdown's contract requires callers to do
+	// beforehand) and the routers above are done.
+	if s.metrics != nil {
+		if err := s.metrics.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	return errors.Join(errs...)
 }

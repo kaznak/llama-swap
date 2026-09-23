@@ -227,6 +227,28 @@
             "default": 5,
             "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
         },
+        "captureLog": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Append one JSON object per metered request to captureLog.path."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Destination file or FIFO. It is opened for appending on first use and never reopened; use a FIFO to hand the stream to an external rotator."
+                },
+                "includeAborted": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also log requests the client abandoned before a response started (HTTP 499). The record carries the request only."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Write-only JSONL request/response log. Independent of captureBuffer; it never feeds /api/captures."
+        },
         "store": {
             "type": "object",
             "properties": {

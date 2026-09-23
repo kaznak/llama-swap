@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/cache"
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -43,6 +44,10 @@ type metricsMonitor struct {
 	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
+	// captureLog is the optional write-only JSONL sink (see capturelog.go).
+	// It is nil when disabled and is deliberately not part of the capture
+	// ring: it neither reads from nor writes to captureCache.
+	captureLog *captureLogWriter
 }
 
 func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
@@ -111,8 +116,23 @@ func (mp *metricsMonitor) debugf(format string, args ...any) {
 	}
 }
 
+// attachCaptureLog starts the JSONL capture sink described by cfg. It is a
+// no-op when the sink is disabled, leaving mp.captureLog nil.
+func (mp *metricsMonitor) attachCaptureLog(cfg config.CaptureLogConfig) {
+	mp.captureLog = newCaptureLogWriter(cfg, mp.logger)
+}
+
+// wantsRequestCapture reports whether the request body/headers must be
+// buffered before dispatch. The capture ring is one consumer; the JSONL sink
+// is the other, and it works with captureBuffer set to 0.
+func (mp *metricsMonitor) wantsRequestCapture() bool {
+	return mp.enableCaptures || mp.captureLog != nil
+}
+
+// Close releases the monitor's resources. Wired into Server.Shutdown so the
+// capture log is flushed and closed on a graceful stop.
 func (mp *metricsMonitor) Close() error {
-	return nil
+	return mp.captureLog.Close()
 }
 
 // activitySource returns connection metadata for activity records. It
@@ -182,6 +202,18 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		mp.debugf("metrics: client disconnected before response, path=%s", r.URL.Path)
 		tm.ErrorMsg = "client disconnected before response"
 		queueAndEmit()
+		// The JSONL sink can record what the ring deliberately does not: the
+		// request of an abandoned call. Opt-in (includeAborted), and the sink
+		// drops it otherwise, so the ring's #1029 behaviour is unchanged.
+		mp.writeCaptureLog(captureLogEvent{
+			outcome:    outcomeClientDisconnected,
+			tm:         tm,
+			r:          r,
+			recorder:   recorder,
+			cf:         cf,
+			reqBody:    reqBody,
+			reqHeaders: reqHeaders,
+		})
 		return
 	}
 
@@ -197,6 +229,21 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		// Capture the request only; the failure is surfaced via ErrorMsg
 		// rather than storing the (possibly undisplayable) response body.
 		tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf&^captureRespBody, reqBody, reqHeaders, nil)
+		// The JSONL sink does keep the failed response body: it is the thing
+		// you need to diagnose an upstream error, and unlike the UI-facing
+		// ring nothing has to render it. It is passed the route's own mask,
+		// not the ring's extra &^captureRespBody, so a route that keeps
+		// response bodies keeps this one too.
+		mp.writeCaptureLog(captureLogEvent{
+			outcome:    outcomeUpstreamError,
+			tm:         tm,
+			r:          r,
+			recorder:   recorder,
+			cf:         cf,
+			reqBody:    reqBody,
+			reqHeaders: reqHeaders,
+			respBody:   decoded,
+		})
 		mp.emitMetric(tm)
 		return
 	}
@@ -205,6 +252,19 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	if len(body) == 0 {
 		mp.logger.Warn("metrics: empty body, recording minimal metrics")
 		queueAndEmit()
+		// A 200 with an empty body is still a request that succeeded, and
+		// until now it left no JSONL line at all. A sink where a missing line
+		// can mean "it worked" is unusable for reconstructing traffic, so the
+		// line goes out with an empty response body.
+		mp.writeCaptureLog(captureLogEvent{
+			outcome:    successOutcome(r),
+			tm:         tm,
+			r:          r,
+			recorder:   recorder,
+			cf:         cf,
+			reqBody:    reqBody,
+			reqHeaders: reqHeaders,
+		})
 		return
 	}
 
@@ -214,6 +274,22 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 			mp.logger.Warnf("metrics: decompression failed: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 			tm.ErrorMsg = fmt.Sprintf("response decompression failed: %v", err)
 			queueAndEmit()
+			// Same hole as above, and here the bytes matter more than the
+			// line: nothing else keeps a body that failed to decompress, and
+			// they are the only evidence of what the upstream actually sent.
+			// They go out as they arrived (respIsWire), so Content-Encoding
+			// stays on the record and the body is base64.
+			mp.writeCaptureLog(captureLogEvent{
+				outcome:    successOutcome(r),
+				tm:         tm,
+				r:          r,
+				recorder:   recorder,
+				cf:         cf,
+				reqBody:    reqBody,
+				reqHeaders: reqHeaders,
+				respBody:   body,
+				respIsWire: true,
+			})
 			return
 		}
 		body = decoded
@@ -257,7 +333,34 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 	tm = stored
 	tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf, reqBody, reqHeaders, body)
+	mp.writeCaptureLog(captureLogEvent{
+		outcome:    successOutcome(r),
+		tm:         tm,
+		r:          r,
+		recorder:   recorder,
+		cf:         cf,
+		reqBody:    reqBody,
+		reqHeaders: reqHeaders,
+		respBody:   body,
+	})
 	mp.emitMetric(tm)
+}
+
+// successOutcome distinguishes a 200 that finished from a 200 whose client
+// hung up part-way through the response. The 499 sentinel cannot be recorded
+// once a status has reached the client (see swaputil.MarkClientClosed), so a
+// streamed response cut short by the client is filed as a plain 200 in the
+// activity log. The JSONL sink says which it was.
+//
+// The test is the client connection's own context, not the request's, for the
+// same reason MarkClientClosed uses it: middleware derive cancellable children
+// (the inflight tracker's operator cancel, the peer router's shutdown link),
+// and a request killed server-side still had a live client.
+func successOutcome(r *http.Request) captureLogOutcome {
+	if swaputil.ClientContext(r.Context()).Err() != nil {
+		return outcomeClientDisconnectedMidStream
+	}
+	return outcomeOK
 }
 
 // storeCapture assembles a ReqRespCapture for id, honoring the captureFields
