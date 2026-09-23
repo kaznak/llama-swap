@@ -143,6 +143,49 @@ type CaptureLogConfig struct {
 	// Default false, matching the activity log, which records them but stores
 	// no capture (#1029).
 	IncludeAborted bool `yaml:"includeAborted" json:"includeAborted"`
+	// Trace opts into the state records. They are off by default because they
+	// carry the expanded cmd, the env and the effective configuration.
+	Trace CaptureLogTraceConfig `yaml:"trace" json:"trace"`
+	// MaskPaths lists gjson/sjson paths whose value is replaced with
+	// RedactedPlaceholder in every record that has them. Empty (the default)
+	// masks nothing: the sink records what it has and this is the only thing
+	// that takes anything back out.
+	//
+	// The paths are matched against the record itself, so they cannot reach
+	// into req.body or resp.body — those are the bytes that went over the
+	// wire and are kept verbatim. A path naming one is rejected at startup.
+	//
+	// Masking is a list of what to hide, not a list of what to allow: a field
+	// nobody listed is written as it is (fail-open).
+	MaskPaths []string `yaml:"maskPaths" json:"maskPaths"`
+	// MaskEnv lists environment variable names whose value is replaced with
+	// RedactedPlaceholder wherever an environment appears in a record (the
+	// backend and checkpoint records, and the models of the effective
+	// configuration the checkpoint carries). Entries are "NAME=value", so the
+	// name selects one exactly. Empty by default, and fail-open like
+	// MaskPaths.
+	MaskEnv []string `yaml:"maskEnv" json:"maskEnv"`
+}
+
+// CaptureLogTraceConfig switches on the capture log's state records. Each one
+// is off by default: the capture log can be enabled for request traffic alone
+// without the expanded command lines, environments and effective
+// configuration these records carry. See CaptureLogConfig.MaskPaths and
+// MaskEnv for taking parts of them back out.
+type CaptureLogTraceConfig struct {
+	// Backend writes one record per process state transition (starting,
+	// ready, stopping, stopped, shutdown), with that process's expanded cmd,
+	// env, resolved upstream and start time.
+	Backend bool `yaml:"backend" json:"backend"`
+	// Config writes one record per configuration reload boundary, so records
+	// on either side of a hot reload are not read under a configuration that
+	// no longer applies.
+	Config bool `yaml:"config" json:"config"`
+	// Checkpoint writes the llama-swap build, the active profile, every
+	// running process and the whole effective configuration as the first line
+	// of each file, so a rotated file can be interpreted without the ones
+	// before it.
+	Checkpoint bool `yaml:"checkpoint" json:"checkpoint"`
 }
 
 type UIConfig struct {

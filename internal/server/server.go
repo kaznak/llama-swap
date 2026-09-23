@@ -256,7 +256,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	// threaded through newMetricsMonitor so the monitor's existing signature
 	// (and every caller of it) stays as it is. Its writer goroutine is
 	// released by Server.Shutdown via metricsMonitor.Close.
-	s.metrics.attachCaptureLog(cfg.CaptureLog)
+	s.metrics.attachCaptureLog(cfg.CaptureLog, s.captureLogState)
 
 	// SysProvider is constructed here because this is where perf and hardware
 	// are in scope; wiring those in later is a change to internal/mcptools.

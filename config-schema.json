@@ -253,6 +253,45 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Also log requests the client abandoned before a response started (HTTP 499). The record carries the request only."
+                },
+                "trace": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write one record per process state transition, carrying that process's macro-expanded cmd, env, resolved upstream and start time. Enabling this writes the expanded command line and environment into the files."
+                        },
+                        "config": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write one record per configuration reload boundary, so records are not interpreted under settings that had already been replaced."
+                        },
+                        "checkpoint": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write the llama-swap build, the active profile, every running process and the whole effective configuration as the first line of each file, so a rotated file can be read without the ones before it. Enabling this writes the effective configuration, including every model's cmd and env, into the files."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {},
+                    "description": "State records that say which backend answered and under which configuration. All off by default because they carry the expanded cmd, the env and the effective configuration; use maskPaths and maskEnv to take parts back out."
+                },
+                "maskPaths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "JSON paths whose value is replaced with [REDACTED], for example backend.cmd or req.headers.Authorization. A path a record does not have is left alone. Cannot reach req.body or resp.body, which are kept verbatim; such a path is refused at startup with a warning. Masking is fail-open: anything not listed is written as it is."
+                },
+                "maskEnv": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "Environment variable names whose value is replaced with [REDACTED] wherever an environment appears in a record. Names rather than paths, because an environment is a list of NAME=value strings no path can select into. Fail-open, like maskPaths."
                 }
             },
             "additionalProperties": false,

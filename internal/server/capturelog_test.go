@@ -32,11 +32,19 @@ import (
 // directory.
 func captureLogSink(t *testing.T, cfg config.CaptureLogConfig) (*metricsMonitor, string) {
 	t.Helper()
+	return captureLogSinkWithState(t, cfg, nil)
+}
+
+// captureLogSinkWithState is captureLogSink with the process-management seam
+// supplied, which is what turns the trace and checkpoint records on. A nil
+// state leaves them off however captureLog.trace is set.
+func captureLogSinkWithState(t *testing.T, cfg config.CaptureLogConfig, state captureLogStateFunc) (*metricsMonitor, string) {
+	t.Helper()
 	if cfg.Dir == "" {
 		cfg.Dir = filepath.Join(t.TempDir(), "captures")
 	}
 	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
-	mm.attachCaptureLog(cfg)
+	mm.attachCaptureLog(cfg, state)
 	t.Cleanup(func() {
 		if err := mm.Close(); err != nil {
 			t.Errorf("metricsMonitor.Close: %v", err)
@@ -277,7 +285,7 @@ func TestCaptureLog_UpstreamErrorKeepsResponseBody(t *testing.T) {
 func TestCaptureLog_DisabledWritesNothing(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "captures")
 	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 5)
-	mm.attachCaptureLog(config.CaptureLogConfig{Enabled: false, Dir: dir})
+	mm.attachCaptureLog(config.CaptureLogConfig{Enabled: false, Dir: dir}, nil)
 
 	if mm.captureLog != nil {
 		t.Fatal("a disabled sink must not start a writer")
@@ -752,7 +760,7 @@ func TestCaptureLog_RotationKeepsEveryByte(t *testing.T) {
 	// threshold is on compressed bytes and a record is never split, so a file
 	// is allowed to overshoot it by its last record — which is exactly what
 	// happens here.
-	w := newCaptureLogWriter(config.CaptureLogConfig{Enabled: true, Dir: dir, MaxFileBytes: 1024}, logmon.NewWriter(io.Discard))
+	w := newCaptureLogWriter(config.CaptureLogConfig{Enabled: true, Dir: dir, MaxFileBytes: 1024}, logmon.NewWriter(io.Discard), nil, nil)
 	if w == nil {
 		t.Fatal("newCaptureLogWriter returned nil for an enabled sink")
 	}

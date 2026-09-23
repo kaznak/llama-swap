@@ -41,9 +41,13 @@ captureLog:
   includeAborted: false
 ```
 
-Each line carries the request and response bodies verbatim plus the activity
-row's timestamp, models, status, duration and token counts, and an `outcome` of
-`ok`, `upstream_error`, `client_disconnected` or
+Every line starts with a `type` naming the kind of record and a `v` giving the
+format version, so a consumer can skip a kind it does not know.
+
+A `request` line carries the request and response bodies verbatim plus the
+request line (`method`, `path` with its query string, `remote_ip`) and the
+activity row's timestamp, models, status, duration and token counts, and an
+`outcome` of `ok`, `upstream_error`, `client_disconnected` or
 `client_disconnected_mid_stream`. A body that is not valid UTF-8 is base64 and
 says so in `body_encoding`.
 
@@ -68,6 +72,75 @@ files — retention is yours to run, by copying them elsewhere or removing them.
 
 Set `includeAborted: true` to also record requests the client abandoned before
 a response started (HTTP 499); those lines carry the request only.
+
+## Recording which backend answered
+
+A request line does not say which process served it or how that process was
+started, so on its own it cannot be used to reproduce an inference. Three
+records under `captureLog.trace` add that, and each is off by default.
+
+```yaml
+captureLog:
+  enabled: true
+  dir: /var/log/llama-swap/captures
+  trace:
+    backend: true
+    config: true
+    checkpoint: true
+```
+
+**Turning any of these on writes the expanded `cmd`, the `env` and — for
+`checkpoint` — the whole effective configuration into the files.** That is
+what makes the log reproducible, and it is also why the switches exist
+separately from `enabled`. Use `maskPaths` and `maskEnv` below before enabling
+them on a host whose configuration carries credentials.
+
+- `backend` writes a `type: backend` line for every process state transition
+  (starting, ready, stopping, stopped, shutdown), with that process's expanded
+  command, environment, resolved upstream and start time. The start time is
+  observed from the transition into `starting`, so a process that was already
+  running reports `started_at: null`.
+- `config` writes a `type: config` line at each configuration reload
+  boundary. llama-swap reloads its configuration without restarting, so
+  without these markers lines written before a reload would be read under
+  settings that no longer applied to them.
+- `checkpoint` writes a `type: checkpoint` line as the first line of every
+  file: the llama-swap build, the active profile, every running process with
+  its expanded command, and the effective configuration whole. Rotation cuts
+  the stream, so without it a file that is not the first one cannot be read on
+  its own.
+
+## Masking fields
+
+The sink records what it has; `maskPaths` and `maskEnv` take parts back out.
+Both are empty by default, which masks nothing.
+
+```yaml
+captureLog:
+  maskPaths:
+    - backend.cmd
+    - req.headers.Authorization
+    - checkpoint.config.models.qwen3.env
+  maskEnv:
+    - OPENAI_API_KEY
+```
+
+`maskPaths` takes JSON paths into a record and replaces the value at each with
+`[REDACTED]`. A path that a record does not have is left alone rather than
+created. `maskEnv` names environment variables instead of paths, because an
+environment is a list of `NAME=value` strings that no path can select into; a
+listed name keeps its name and loses its value, wherever it appears.
+
+Two limits are worth planning around:
+
+- **Bodies cannot be masked.** `req.body` and `resp.body` are the bytes that
+  went over the wire, kept verbatim, which is the whole premise of the format.
+  A `maskPaths` entry naming a body — or naming `req` or `resp`, which would
+  remove one — is refused at startup with a warning in the proxy log. A secret
+  in a request body stays in the file.
+- **Masking is fail-open.** It is a list of what to hide, not a list of what
+  to allow. A header, a command-line flag or a configuration key nobody listed
+  is written as it is.
 
 The sink holds full request and response bodies, so it inherits the warning
 above with more force: write it somewhere only operators can read, and turn it

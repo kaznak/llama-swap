@@ -85,6 +85,42 @@ func (c Config) RedactedYAML(path string) (out string, found bool, err error) {
 	return string(buf), true, nil
 }
 
+// RedactedFullYAML applies RedactedYAML's redaction without its pruning:
+// every key the effective configuration carries is rendered, including the
+// ones whose resolved value is empty.
+//
+// It is not here because the pruning loses anything. Defaults are already
+// resolved by the time either of these marshals, so a key pruneEmpty drops
+// had resolved to empty, and a reader who knows that recovers the same
+// configuration from either form.
+//
+// It is here because the two are read by different audiences and only one of
+// them can ask again. RedactedYAML answers a question someone is asking now,
+// and prunes to stay inside a diagnostic tool's output budget — a constraint
+// that belongs to that caller and can be retuned for its sake. The capture
+// log's checkpoint is the opposite: it is written once into a file that is
+// read later, by someone who may have neither the tool nor this version of
+// llama-swap, and it should not inherit a shape that moves for reasons
+// unrelated to it. Redaction is shared because it is about the content;
+// pruning is not because it is about the presentation.
+func (c Config) RedactedFullYAML() ([]byte, error) {
+	marshaled, err := yaml.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling config: %w", err)
+	}
+
+	var tree any
+	if err := yaml.Unmarshal(marshaled, &tree); err != nil {
+		return nil, fmt.Errorf("re-parsing config: %w", err)
+	}
+
+	buf, err := yaml.Marshal(redactValue("", tree))
+	if err != nil {
+		return nil, fmt.Errorf("marshaling redacted config: %w", err)
+	}
+	return buf, nil
+}
+
 // pruneEmpty removes nil, empty strings, empty maps and empty slices. Booleans
 // and numbers are kept: they are compact and a false or 0 can be deliberate.
 func pruneEmpty(v any) (any, bool) {

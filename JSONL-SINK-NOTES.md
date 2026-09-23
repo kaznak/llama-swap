@@ -407,3 +407,92 @@ nix shell nixpkgs#go --command go run honnef.co/go/tools/cmd/staticcheck@latest 
 `internal/config/mcpprovider.go` 1 / `internal/perf` 9 / `internal/swaputil/http.go` 1）で、
 **capture sink が触った範囲（`internal/server/capturelog*.go` / `internal/config/config.go`）
 への指摘は 0 件**。上流由来の 16 件は直していない。
+
+## 9. 第 3 版（2026-09-23）— トレース・チェックポイント・マスク
+
+第 2 版までの出口は**リクエストの記録しか持たなかった**ため、記録を見ても
+「どのバックエンドが、どの設定で答えたのか」が分からず、推論サーバの入出力を再現できなかった。
+第 3 版でそこを埋める。**レコードの verbatim 性・`body: null` と `body: ""` の型レベルの区別・
+単一 writer goroutine の所有・投入側の非ブロック性・ローテーションの意味論・`record` の 5 箇所の
+emit 位置**はいずれも無変更。
+
+### 9.1 触ったファイル（第 3 版）
+
+| ファイル | 変更 |
+|---|---|
+| `internal/server/capturelog.go` | `type` / `v` の導入、`request` レコードに `method` / `remote_ip` / クエリ込み `path`、writer への `mask` / `checkpoint` フック |
+| `internal/server/capturelogmask.go` | 新規。マスク機構（`maskPaths` の sjson 適用、`maskEnv` の名前指定、本文パスの拒否） |
+| `internal/server/capturelogtrace.go` | 新規。イベントバス購読・スナップショット・チェックポイント描画・Server 側の状態 seam |
+| `internal/server/capturelogtrace_test.go` | 新規。14 テスト |
+| `internal/server/capturelog_test.go` | ヘルパ 2 箇所の署名追従のみ |
+| `internal/server/metrics.go` | `captureLogTrace` フィールド、`attachCaptureLog` の組み立て順、`Close` で購読解除 |
+| `internal/server/server.go` | 1 行（`attachCaptureLog` に `s.captureLogState` を渡す） |
+| `internal/config/config.go` | `CaptureLogTraceConfig`、`MaskPaths`、`MaskEnv` |
+| `config-schema.json` / `docs/config.example.yaml` / `docs/kb/guides/operations/observability-storage-and-activity.md` | 新設定の説明（機密が入ること・マスクの案内・fail-open と本文非対象の明記） |
+
+### 9.2 レコードの種別と形式版
+
+全レコードの先頭に `"type"` と `"v"`（`captureLogFormatVersion = 1`）を置いた。
+種別は `request` / `backend` / `config` / `checkpoint`。
+`backend` / `config` / `checkpoint` は**ペイロードを種別名のキーの下に入れ子**にしてある
+（`{"type":"backend", …, "backend":{…}}`）。マスクのパスが
+`backend.cmd` / `req.headers.Authorization` のように種別ごとに一意に書けるため。
+
+### 9.3 マクロ展開後の `cmd` は取れる（実測）
+
+設定上の `cmd` はテンプレートだが、**マクロ展開は設定ロード時に完了している**
+（`internal/config/macros.go` の `resolveConfigMacros` が `${…}` / `${PORT}` / `${MODEL_ID}` /
+`${env.*}` を typed `Config` に焼き込む）。`${PID}` だけは実行時展開だが、これは `cmdStop`
+専用で `cmd` には現れない（`config/macros.go:351` の `allowPID`）。したがって
+`cfg.Models[id].Cmd` は展開後の実物で、`SanitizedCommand()`（`process.doStart` が
+`exec.Command` に渡すのと**同じ呼び出し**）で argv になる。upstream も同様に
+`Proxy` が解決済み（`http://localhost:5800`）。
+
+### 9.4 `ReloadingStateStart` は現状どこからも emit されていない
+
+`swaputil.ReloadingStateStart` / `End` の両方を書く実装にしたが、**リポジトリ内で
+`event.Emit` しているのは `llama-swap.go:386` の `ReloadingStateEnd` だけ**で、
+`Start` の emit 箇所が存在しない。しかも `End` は新 Server 構築・旧 Server shutdown の
+**3 秒後**に `time.AfterFunc` で飛ぶので、受け取るのは新 Server 側の出口になる。
+実装は両方を扱うので、`Start` が emit されるようになればそのまま記録される。
+
+### 9.5 チェックポイントの seam を writer の外に置いた
+
+要求は「writer goroutine をプロセス管理の取得でブロックさせない」。取った形:
+
+- `captureLogStateFunc`（構築時に渡す）が唯一の窓口。`Server.captureLogState` が実装で、
+  `s.local.RunningModels()`・`s.ActiveProfile()`・`yaml.Marshal(s.cfg)` を読む。
+- **呼ぶのは tracer の goroutine だけ**（構築時と各イベント配送時）。結果は
+  `atomic.Pointer[captureLogSnapshot]` に publish する。
+- writer goroutine が呼ぶ `checkpointLine(now)` は**この atomic を load して整形するだけ**。
+  ルータのロックにも、起動中のプロセスにも触らない。実効設定の JSON 化は
+  `sync.OnceValues` で tracer 側に 1 回だけ寄せてある（設定は Server の生存期間中不変）。
+
+### 9.6 順序は同じキューで保つ
+
+トレースはイベント経由で非同期に届くが、**`captureLogWriter.write` という同じ channel** に
+入れる。別経路でファイルに直接書かせていない（単一 writer goroutine の所有を壊さないため）。
+`TestCaptureLog_TraceAndRequestsKeepOrder` が backend / request / config の並びを固定する。
+
+チェックポイントだけは writer がファイルを開いた直後に**ファイルの 1 行目として**書く。
+サイズ閾値の判定はこのとき行わない（どのファイルも「前文 ＋ 最低 1 レコード」になる）。
+
+### 9.7 マスクの境界
+
+- `maskPaths` は**符号化済みの行に sjson で適用**する。sjson は触らない部分をバイト列のまま
+  残すので、**マスクした行でも本文は verbatim のまま**。存在しないパスは
+  `gjson.Exists` で弾いてから set する（sjson は無いパスを**作ってしまう**ため。
+  作らせるとリクエストレコードに `backend` が生えて「フィールドの不在」の意味が壊れる）。
+- **`req.body` / `resp.body` およびそれを含む `req` / `resp` は起動時に拒否**し、警告を出す。
+  本文を verbatim で持つのがこの形式の根本の約束なので、パスで書き換えさせない。
+- `maskEnv` は**レコード組み立て時**に適用する。env は `"NAME=value"` の配列で
+  名前が値の内側にあり、JSON パスでは 1 エントリを選べないため。チェックポイントが運ぶ
+  実効設定の `models.*.env` にも、汎用値を歩いて同じマスクを掛ける。
+- **fail-open**（列挙漏れは漏れる）と**本文非対象**は設定の説明 3 箇所すべてに明記した。
+
+### 9.8 状態記録は既定 false の個別スイッチ
+
+`captureLog.enabled` は出口全体の親スイッチのまま。そのうえで
+`captureLog.trace.backend` / `.config` / `.checkpoint` を**既定 false** で追加した。
+`request` レコードへの `type` / `v` / `method` / 完全 `path` / `remote_ip` の追加は
+スイッチ無しで常に入る（機密ではないため）。

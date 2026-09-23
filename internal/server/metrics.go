@@ -48,6 +48,10 @@ type metricsMonitor struct {
 	// It is nil when disabled and is deliberately not part of the capture
 	// ring: it neither reads from nor writes to captureCache.
 	captureLog *captureLogWriter
+	// captureLogTrace subscribes the sink to the process-wide event bus so
+	// the log also says which backend answered and under which
+	// configuration. Nil unless one of captureLog.trace.* is on.
+	captureLogTrace *captureLogTracer
 }
 
 func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
@@ -118,8 +122,25 @@ func (mp *metricsMonitor) debugf(format string, args ...any) {
 
 // attachCaptureLog starts the JSONL capture sink described by cfg. It is a
 // no-op when the sink is disabled, leaving mp.captureLog nil.
-func (mp *metricsMonitor) attachCaptureLog(cfg config.CaptureLogConfig) {
-	mp.captureLog = newCaptureLogWriter(cfg, mp.logger)
+//
+// state is the seam to process management, used by the trace and checkpoint
+// records; a nil one disables them. The order here is forced: the writer needs
+// the tracer's checkpoint renderer to open its first file, and the tracer must
+// not start emitting before the writer it emits into exists.
+func (mp *metricsMonitor) attachCaptureLog(cfg config.CaptureLogConfig, state captureLogStateFunc) {
+	mask := newCaptureLogMask(cfg, mp.logger)
+	tracer := newCaptureLogTracer(cfg, mask, state, mp.logger)
+	var checkpoint func(time.Time) []byte
+	if tracer != nil {
+		checkpoint = tracer.checkpointLine
+	}
+	writer := newCaptureLogWriter(cfg, mp.logger, mask, checkpoint)
+	if writer == nil {
+		return
+	}
+	mp.captureLog = writer
+	mp.captureLogTrace = tracer
+	tracer.start(writer)
 }
 
 // wantsRequestCapture reports whether the request body/headers must be
@@ -131,7 +152,13 @@ func (mp *metricsMonitor) wantsRequestCapture() bool {
 
 // Close releases the monitor's resources. Wired into Server.Shutdown so the
 // capture log is flushed and closed on a graceful stop.
+//
+// The event subscriptions go first: they are process-wide, so a retired
+// Server that kept them would go on writing state records into a sink that is
+// draining. The sink is closed second, which lets a record an in-flight event
+// already queued still reach the file.
 func (mp *metricsMonitor) Close() error {
+	mp.captureLogTrace.Close()
 	return mp.captureLog.Close()
 }
 

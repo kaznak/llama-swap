@@ -37,6 +37,28 @@ import (
 //     reached the client,
 //   - optionally (includeAborted) the 499 client-closed requests that #1029
 //     deliberately keeps out of the ring.
+//
+// Requests alone do not say which backend answered them or how it was
+// configured, so the sink also carries state records (capturelogtrace.go): a
+// backend record per process state transition, a config record per hot-reload
+// boundary, and a checkpoint at the head of every file. They are opt-in
+// because they carry expanded command lines, environments and the effective
+// configuration; see config.CaptureLogTraceConfig.
+
+// captureLogFormatVersion is the "v" every record carries. It is the version
+// of the record format, not of llama-swap: a consumer reads it to know which
+// fields to expect. Bump it when a field's meaning changes.
+const captureLogFormatVersion = 1
+
+// The record kinds, carried in every record's leading "type". A consumer
+// dispatches on this before looking at anything else, and a kind it does not
+// know is a line it can skip whole.
+const (
+	captureLogTypeRequest    = "request"
+	captureLogTypeBackend    = "backend"
+	captureLogTypeConfig     = "config"
+	captureLogTypeCheckpoint = "checkpoint"
+)
 
 // captureLogOutcome classifies how a metered request ended.
 type captureLogOutcome string
@@ -124,10 +146,19 @@ type captureLogTokens struct {
 // captureLogRecord is one JSONL line: the capture envelope joined with the
 // activity row, so a consumer needs nothing else to interpret it.
 type captureLogRecord struct {
-	ID             int               `json:"id"`
-	TS             string            `json:"ts"`
-	Outcome        captureLogOutcome `json:"outcome"`
+	Type string `json:"type"`
+	V    int    `json:"v"`
+	ID   int    `json:"id"`
+	TS   string `json:"ts"`
+	// Method and Path are the request line. Path is the target as the
+	// upstream saw it, query string included: without the query a GET is not
+	// reproducible, and llama-swap rewrites the path in place (/v/… and
+	// /audioapi/… are stripped before dispatch), so this is the rewritten
+	// form rather than what the client typed.
+	Method         string            `json:"method"`
 	Path           string            `json:"path"`
+	RemoteIP       string            `json:"remote_ip"`
+	Outcome        captureLogOutcome `json:"outcome"`
 	RequestedModel string            `json:"requested_model"`
 	UsedModel      string            `json:"used_model"`
 	Status         int               `json:"status"`
@@ -293,6 +324,17 @@ type captureLogWriter struct {
 	includeAborted bool
 	logger         *logmon.Monitor
 
+	// mask is the redaction applied to every line the sink encodes. It is nil
+	// when nothing is configured, and its methods tolerate that.
+	mask *captureLogMask
+
+	// checkpoint renders the state dump that goes at the head of a file, or
+	// returns nil when checkpoints are off. It is called by the writer
+	// goroutine immediately after a file is opened, so it must not reach into
+	// process management: the tracer keeps a snapshot up to date on its own
+	// goroutine and this only formats it (see capturelogtrace.go).
+	checkpoint func(time.Time) []byte
+
 	lines chan []byte
 	// quit is closed by Close. It is never nil. lines is deliberately never
 	// closed, so a request racing with shutdown cannot send on a closed
@@ -317,7 +359,11 @@ type captureLogWriter struct {
 // reported immediately. The files inside it are opened lazily by the writer
 // goroutine, so an enabled sink that never sees a request leaves no empty
 // stream behind.
-func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor) *captureLogWriter {
+//
+// mask and checkpoint come from attachCaptureLog: the first is shared with
+// the trace records so one configuration covers every line, the second is nil
+// unless captureLog.trace.checkpoint is on.
+func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor, mask *captureLogMask, checkpoint func(time.Time) []byte) *captureLogWriter {
 	if !cfg.Enabled {
 		return nil
 	}
@@ -343,6 +389,8 @@ func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor) *c
 		level:          cfg.Level,
 		includeAborted: cfg.IncludeAborted,
 		logger:         logger,
+		mask:           mask,
+		checkpoint:     checkpoint,
 		lines:          make(chan []byte, captureLogQueueDepth),
 		quit:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -423,13 +471,28 @@ func (w *captureLogWriter) run() {
 			return
 		}
 		if cur == nil {
-			f, err := openCaptureLogFile(w.dir, w.level, time.Now())
+			now := time.Now()
+			f, err := openCaptureLogFile(w.dir, w.level, now)
 			if err != nil {
 				w.warnf("capture log %s: open failed: %v; capture log disabled for this run", w.dir, err)
 				broken = true
 				return
 			}
 			cur = f
+			// The checkpoint is the file's first line, written before the
+			// record that caused the file to be opened. Rotation otherwise
+			// leaves a file that cannot be read without the ones before it:
+			// the trace records that say which backend is running and under
+			// which configuration are all in an earlier file. The size
+			// threshold is deliberately not tested here — a file always gets
+			// its preamble plus at least one record.
+			if w.checkpoint != nil {
+				if cp := w.checkpoint(now); cp != nil {
+					if err := cur.write(cp); err != nil && w.warned.CompareAndSwap(false, true) {
+						w.warnf("capture log %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
+					}
+				}
+			}
 		}
 		if err := cur.write(line); err != nil && w.warned.CompareAndSwap(false, true) {
 			w.warnf("capture log %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
@@ -504,10 +567,14 @@ func (mp *metricsMonitor) writeCaptureLog(ev captureLogEvent) {
 
 	tm := ev.tm
 	rec := captureLogRecord{
+		Type:       captureLogTypeRequest,
+		V:          captureLogFormatVersion,
 		ID:         tm.ID,
 		TS:         tm.Timestamp.Format(captureLogTimeFormat),
+		Method:     requestMethod(ev.r),
+		Path:       requestTarget(ev.r, tm.ReqPath),
+		RemoteIP:   requestRemoteIP(ev.r),
 		Outcome:    ev.outcome,
-		Path:       tm.ReqPath,
 		UsedModel:  tm.Model,
 		Status:     tm.RespStatusCode,
 		DurationMs: tm.DurationMs,
@@ -567,7 +634,38 @@ func (mp *metricsMonitor) writeCaptureLog(ev captureLogEvent) {
 		mp.warnf("capture log: encoding record %d failed: %v", tm.ID, err)
 		return
 	}
-	mp.captureLog.write(line)
+	mp.captureLog.write(mp.captureLog.mask.applyPaths(line))
+}
+
+// requestMethod, requestTarget and requestRemoteIP read the request line off
+// the finished request. record() runs after the handler returns, but nothing
+// in the chain mutates these afterwards, so they are the values the upstream
+// was addressed with.
+//
+// remote_ip is resolved exactly as the in-flight view resolves it
+// (clientIP: X-Forwarded-For, then X-Real-IP, then the connection address),
+// so the same request reads the same in both places.
+func requestMethod(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return r.Method
+}
+
+// requestTarget prefers the live URL so the query string survives; fallback is
+// the activity row's path, which is the same value without it.
+func requestTarget(r *http.Request, fallback string) string {
+	if r == nil || r.URL == nil {
+		return fallback
+	}
+	return r.URL.RequestURI()
+}
+
+func requestRemoteIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return clientIP(r)
 }
 
 // declaredRequestLength is the size to report for a request body the capture
@@ -611,7 +709,7 @@ func encodeBody(body []byte) (string, string) {
 // encodeCaptureLogRecord renders rec as one JSONL line (trailing newline
 // included). HTML escaping is off so bodies read as they were sent; the bytes
 // still round-trip exactly either way.
-func encodeCaptureLogRecord(rec *captureLogRecord) ([]byte, error) {
+func encodeCaptureLogRecord(rec any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
