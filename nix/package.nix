@@ -10,12 +10,16 @@
 
   # Build metadata stamped into the binary. `make` fills these from git (see
   # GIT_VERSION / GIT_HASH / BUILD_DATE in the Makefile); a nix build has no
-  # git in its sandbox, so they are passed in instead. flake.nix derives
-  # `commit` and `date` from the revision it is building. A plain
+  # git in its sandbox, so they are passed in instead. flake.nix derives them
+  # from the revision it is building. A plain
   # `pkgs.callPackage ./nix/package.nix { }` gets the defaults below, and
   # `llama-swap -version` then reports the commit as "unknown".
-  commit ? "unknown",
-  date ? "1970-01-01T00:00:00Z",
+  #
+  # Not named `commit`: callPackage fills any argument that matches an
+  # attribute of the package set, and nixpkgs has a package called `commit`,
+  # so the default would silently become a store path.
+  commitHash ? "unknown",
+  buildDate ? "1970-01-01T00:00:00Z",
 
   # Build the Svelte UI and embed it. Turning this off drops the node
   # toolchain from the build closure; internal/server/embed_notag.go then
@@ -89,8 +93,8 @@ buildGo127Module {
     "-s"
     "-w"
     "-X main.version=${version}"
-    "-X main.commit=${commit}"
-    "-X main.date=${date}"
+    "-X main.commit=${commitHash}"
+    "-X main.date=${buildDate}"
   ];
 
   preBuild = lib.optionalString withUI ''

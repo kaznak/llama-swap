@@ -64,7 +64,10 @@
     {
       packages = forAllSystems (pkgs: rec {
         default = llama-swap;
-        llama-swap = pkgs.callPackage ./nix/package.nix { inherit commit date; };
+        llama-swap = pkgs.callPackage ./nix/package.nix {
+          commitHash = commit;
+          buildDate = date;
+        };
         # The Svelte bundle on its own, without the Go binary around it.
         llama-swap-ui = llama-swap.ui;
       });
@@ -72,7 +75,10 @@
       # For flake consumers that already have their own nixpkgs:
       #   nixpkgs.overlays = [ llama-swap.overlays.default ];
       overlays.default = final: _prev: {
-        llama-swap = final.callPackage ./nix/package.nix { inherit commit date; };
+        llama-swap = final.callPackage ./nix/package.nix {
+          commitHash = commit;
+          buildDate = date;
+        };
       };
 
       devShells = forAllSystems (pkgs: {
