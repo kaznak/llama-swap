@@ -68,9 +68,19 @@ buildGo127Module {
   # Drop the duplicate here rather than in go.mod so that this branch adds
   # nothing outside nix/ and flake.nix. `go mod tidy` removes exactly this
   # line, so this patch can go away as soon as go.mod is tidied upstream.
+  #
+  # The branch that does tidy go.mod merges with this one, so the line is
+  # already gone in that tree and the sed has to be allowed to match nothing.
+  # Phases run under `set -e`, so a bare `grep -q` here would not guard the
+  # sed -- it would abort the build the moment upstream fixed the duplicate,
+  # which is the opposite of what a workaround should do. The message below
+  # is how this hook says it has outlived its purpose.
   postPatch = ''
-    grep -q '^	golang.org/x/sync v[0-9.]* // indirect$' go.mod
-    sed -i '/^	golang.org\/x\/sync v[0-9.]* \/\/ indirect$/d' go.mod
+    if grep -q '^	golang.org/x/sync v[0-9.]* // indirect$' go.mod; then
+      sed -i '/^	golang.org\/x\/sync v[0-9.]* \/\/ indirect$/d' go.mod
+    else
+      echo "postPatch: go.mod no longer requires golang.org/x/sync twice; this hook can be removed"
+    fi
   '';
 
   # Run `nix build` after changing go.mod/go.sum and copy the hash nix reports
