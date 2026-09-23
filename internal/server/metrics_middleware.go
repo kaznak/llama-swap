@@ -54,7 +54,11 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			cf := captureFieldsFor(checkPath)
 			var reqBody []byte
 			var reqHeaders map[string]string
-			if mm.enableCaptures {
+			// Buffered for the capture ring and/or the JSONL sink. The sink
+			// is usable with captureBuffer set to 0, so the ring's own flag
+			// is no longer the only reason to buffer; what is buffered, and
+			// the cf mask that decides it, is unchanged.
+			if mm.wantsRequestCapture() {
 				if cf&captureReqBody != 0 && r.Body != nil {
 					if buffered, err := io.ReadAll(r.Body); err == nil {
 						reqBody = buffered

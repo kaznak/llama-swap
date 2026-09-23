@@ -227,6 +227,77 @@
             "default": 5,
             "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
         },
+        "trace": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Write one JSON object per metered request into trace.dir."
+                },
+                "dir": {
+                    "type": "string",
+                    "description": "Destination directory, created if missing. Files are named trace-<timestamp>.jsonl.zst and each is a complete, independently decompressible zstd stream; they are never renamed, reopened or deleted."
+                },
+                "maxFileBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 268435456,
+                    "description": "Start a new file once the current one reaches this many compressed bytes. Not a hard limit: a record is never split, so a file grows to this size plus its last record."
+                },
+                "level": {
+                    "type": "integer",
+                    "description": "zstd compression level, in zstd(1)'s numbering. Omit to use the compressor's default."
+                },
+                "includeAborted": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also log requests the client abandoned before a response started (HTTP 499). The record carries the request only."
+                },
+                "state": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write one record per process state transition, carrying that process's macro-expanded cmd, env, resolved upstream and start time. Enabling this writes the expanded command line and environment into the files."
+                        },
+                        "config": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write one record per configuration reload boundary, so records are not interpreted under settings that had already been replaced."
+                        },
+                        "checkpoint": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Write the llama-swap build, the active profile, every running process and the whole effective configuration as the first line of each file, so a rotated file can be read without the ones before it. Enabling this writes the effective configuration, including every model's cmd and env, into the files."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {},
+                    "description": "State records that say which backend answered and under which configuration. All off by default because they carry the expanded cmd, the env and the effective configuration; use maskPaths and maskEnv to take parts back out."
+                },
+                "maskPaths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "JSON paths whose value is replaced with [REDACTED], for example backend.cmd or req.headers.Authorization. A path a record does not have is left alone. Cannot reach req.body or resp.body, which are kept verbatim; such a path is refused at startup with a warning. Masking is fail-open: anything not listed is written as it is."
+                },
+                "maskEnv": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "Environment variable names whose value is replaced with [REDACTED] wherever an environment appears in a record. Names rather than paths, because an environment is a list of NAME=value strings no path can select into. Fail-open, like maskPaths."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Write-only zstd-compressed JSONL request/response trace. Nothing reads it back."
+        },
         "store": {
             "type": "object",
             "properties": {

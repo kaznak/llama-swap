@@ -63,6 +63,50 @@ metricsMaxInMemory: 1000
 # - set to 0 to disable
 captureBuffer: 15
 
+# trace: write one JSON object per metered request into a directory of
+# zstd-compressed, size-rotated files
+# - optional, disabled by default
+# - write-only: nothing reads it back
+# - records what the in-memory captures drop: failed responses' bodies and
+#   clients that hang up part-way through a stream
+# - dir is created if missing; files are trace-<timestamp>.jsonl.zst and
+#   each one decompresses on its own (zstd -d)
+# - maxFileBytes is measured on compressed bytes and is not a hard limit: a
+#   record is never split, so a file grows to that size plus its last record
+# - llama-swap never deletes old files; copy or remove them yourself
+# - includeAborted also logs requests abandoned before a response started (499)
+# - state.* add the state records that say which backend answered and under
+#   which configuration; all three are off by default because ENABLING THEM
+#   WRITES THE EXPANDED cmd, THE env AND THE WHOLE EFFECTIVE CONFIGURATION
+#   into the files. Use maskPaths/maskEnv below before turning them on.
+#   - state.backend: one line per process state transition, with that
+#     process's expanded cmd, env, resolved upstream and start time
+#   - state.config: one line per configuration reload boundary, so records are
+#     not read under settings that had already been replaced
+#   - state.checkpoint: build, active profile, every running process and the
+#     effective configuration, as the first line of every file
+# - maskPaths replaces the value at each JSON path with [REDACTED]; maskEnv
+#   does the same by environment variable name (env is a list of NAME=value,
+#   which no path can select into). Both are empty by default = nothing masked
+# - masking cannot reach req.body/resp.body: those are the bytes that went over
+#   the wire and are kept verbatim, so a path naming one is refused at startup
+# - masking is fail-open: anything you did not list is written as it is
+# trace:
+#   enabled: true
+#   dir: /var/log/llama-swap/trace
+#   maxFileBytes: 268435456
+#   level: 3
+#   includeAborted: false
+#   state:
+#     backend: false
+#     config: false
+#     checkpoint: false
+#   maskPaths:
+#     - backend.cmd
+#     - req.headers.Authorization
+#   maskEnv:
+#     - OPENAI_API_KEY
+
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.
 # - optional, default: ["X-Session-ID", "X-Litellm-Session-Id"]

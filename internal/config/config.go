@@ -120,6 +120,72 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
+// TraceConfig configures the rotating, zstd-compressed JSONL request/response
+// trace. It is a write-only sink: nothing reads it back.
+type TraceConfig struct {
+	// Enabled turns the sink on. Default false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Dir is the directory the sink writes into, created if missing. Files are
+	// named trace-<timestamp>.jsonl.zst, and each one is a complete,
+	// independently decompressible zstd stream. llama-swap never renames,
+	// reopens or deletes them.
+	Dir string `yaml:"dir" json:"dir"`
+	// MaxFileBytes rotates the current file once its compressed size reaches
+	// this many bytes. It is not a hard cap: a record is never split, so the
+	// file grows to this size plus its last record. Default 256 MiB.
+	MaxFileBytes int64 `yaml:"maxFileBytes" json:"maxFileBytes"`
+	// Level is the zstd compression level in zstd(1)'s numbering. Unset (0)
+	// leaves the compressor's own default.
+	Level int `yaml:"level" json:"level"`
+	// IncludeAborted also logs 499 client-closed requests (request only).
+	// Default false, matching the activity log, which records them but stores
+	// no capture (#1029).
+	IncludeAborted bool `yaml:"includeAborted" json:"includeAborted"`
+	// State opts into the state records. They are off by default because they
+	// carry the expanded cmd, the env and the effective configuration.
+	State TraceStateConfig `yaml:"state" json:"state"`
+	// MaskPaths lists gjson/sjson paths whose value is replaced with
+	// RedactedPlaceholder in every record that has them. Empty (the default)
+	// masks nothing: the sink records what it has and this is the only thing
+	// that takes anything back out.
+	//
+	// The paths are matched against the record itself, so they cannot reach
+	// into req.body or resp.body — those are the bytes that went over the
+	// wire and are kept verbatim. A path naming one is rejected at startup.
+	//
+	// Masking is a list of what to hide, not a list of what to allow: a field
+	// nobody listed is written as it is (fail-open).
+	MaskPaths []string `yaml:"maskPaths" json:"maskPaths"`
+	// MaskEnv lists environment variable names whose value is replaced with
+	// RedactedPlaceholder wherever an environment appears in a record (the
+	// backend and checkpoint records, and the models of the effective
+	// configuration the checkpoint carries). Entries are "NAME=value", so the
+	// name selects one exactly. Empty by default, and fail-open like
+	// MaskPaths.
+	MaskEnv []string `yaml:"maskEnv" json:"maskEnv"`
+}
+
+// TraceStateConfig switches on the trace's state records. Each one is off by
+// default: the trace can be enabled for request traffic alone without the
+// expanded command lines, environments and effective configuration these
+// records carry. See TraceConfig.MaskPaths and MaskEnv for taking parts of
+// them back out.
+type TraceStateConfig struct {
+	// Backend writes one record per process state transition (starting,
+	// ready, stopping, stopped, shutdown), with that process's expanded cmd,
+	// env, resolved upstream and start time.
+	Backend bool `yaml:"backend" json:"backend"`
+	// Config writes one record per configuration reload boundary, so records
+	// on either side of a hot reload are not read under a configuration that
+	// no longer applies.
+	Config bool `yaml:"config" json:"config"`
+	// Checkpoint writes the llama-swap build, the active profile, every
+	// running process and the whole effective configuration as the first line
+	// of each file, so a rotated file can be interpreted without the ones
+	// before it.
+	Checkpoint bool `yaml:"checkpoint" json:"checkpoint"`
+}
+
 type UIConfig struct {
 	Activity UIActivityConfig `yaml:"activity" json:"activity"`
 }
@@ -160,6 +226,7 @@ type Config struct {
 	LogToStdout        string            `yaml:"logToStdout"`
 	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
 	CaptureBuffer      int               `yaml:"captureBuffer"`
+	Trace              TraceConfig       `yaml:"trace"`
 	Store              *Store            `yaml:"store"`
 	UI                 UIConfig          `yaml:"ui"`
 	Performance        PerformanceConfig `yaml:"performance"`
