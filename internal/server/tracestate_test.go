@@ -21,11 +21,11 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
-// captureLogTestConfig is a configuration whose command is a macro template,
+// traceTestConfig is a configuration whose command is a macro template,
 // so a test that reads back the recorded cmd is reading the expansion rather
 // than the text in the file. ${PORT} is allocated from startPort and
 // ${MODEL_ID} from the model key, and both also reach the default proxy.
-const captureLogTestConfig = `
+const traceTestConfig = `
 startPort: 5800
 macros:
   server-bin: /opt/llama-server --flash-attn
@@ -40,47 +40,46 @@ models:
       - PLAIN=1
 `
 
-// captureLogStateStub stands in for the Server as the capture log's window
+// traceStateStub stands in for the Server as the trace's window
 // onto process management. The configuration goes through the real loader and
-// the detail through the real captureLogModelDetails, so what the tests read
+// the detail through the real traceModelDetails, so what the tests read
 // back is what a running llama-swap would record.
-type captureLogStateStub struct {
+type traceStateStub struct {
 	mu      sync.Mutex
 	cfg     config.Config
 	running map[string]string
 	profile string
 }
 
-func newCaptureLogStateStub(t *testing.T, source string) *captureLogStateStub {
+func newTraceStateStub(t *testing.T, source string) *traceStateStub {
 	t.Helper()
 	cfg, err := config.LoadConfigFromReader(strings.NewReader(source))
 	if err != nil {
 		t.Fatalf("loading the test configuration: %v", err)
 	}
-	return &captureLogStateStub{cfg: cfg, running: map[string]string{}}
+	return &traceStateStub{cfg: cfg, running: map[string]string{}}
 }
 
-func (s *captureLogStateStub) state() captureLogServerState {
+func (s *traceStateStub) state() traceServerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	running := make(map[string]string, len(s.running))
 	for name, state := range s.running {
 		running[name] = state
 	}
-	return captureLogServerState{
-		Build:   captureLogBuild{Version: "v1.2.3", Commit: "deadbeef", Date: "2026-09-23"},
+	return traceServerState{
+		Build:   traceBuild{Version: "v1.2.3", Commit: "deadbeef", Date: "2026-09-23"},
 		Profile: s.profile,
 		Running: running,
-		Models:  captureLogModelDetails(s.cfg),
-		// The same method Server.captureLogState hands over, not a
-		// reimplementation of it: a stub that marshals the configuration its
-		// own way would have let the redaction go missing without a test
-		// noticing.
+		Models:  traceModelDetails(s.cfg),
+		// The same method Server.traceState hands over, not a reimplementation
+		// of it: a stub that marshals the configuration its own way would have
+		// let the redaction go missing without a test noticing.
 		ConfigYAML: s.cfg.RedactedFullYAML,
 	}
 }
 
-func (s *captureLogStateStub) setRunning(name, state string) {
+func (s *traceStateStub) setRunning(name, state string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state == "" {
@@ -90,14 +89,14 @@ func (s *captureLogStateStub) setRunning(name, state string) {
 	s.running[name] = state
 }
 
-// captureLogRawLines closes the sink and returns each line as a generic JSON
+// traceRawLines closes the sink and returns each line as a generic JSON
 // object, so records of every kind can be inspected in one pass.
-func captureLogRawLines(t *testing.T, mm *metricsMonitor, dir string) []map[string]any {
+func traceRawLines(t *testing.T, mm *metricsMonitor, dir string) []map[string]any {
 	t.Helper()
-	return captureLogDecodeLines(t, readCaptureLogBytes(t, mm, dir))
+	return traceDecodeLines(t, readTraceBytes(t, mm, dir))
 }
 
-func captureLogDecodeLines(t *testing.T, data []byte) []map[string]any {
+func traceDecodeLines(t *testing.T, data []byte) []map[string]any {
 	t.Helper()
 	var out []map[string]any
 	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
@@ -106,16 +105,16 @@ func captureLogDecodeLines(t *testing.T, data []byte) []map[string]any {
 		}
 		var rec map[string]any
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			t.Fatalf("capture log line is not valid JSON: %v\nline: %q", err, line)
+			t.Fatalf("trace line is not valid JSON: %v\nline: %q", err, line)
 		}
 		out = append(out, rec)
 	}
 	return out
 }
 
-// captureLogTypes is the sequence of record kinds, which is what the ordering
+// traceTypes is the sequence of record kinds, which is what the ordering
 // assertions are about.
-func captureLogTypes(lines []map[string]any) []string {
+func traceTypes(lines []map[string]any) []string {
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		kind, _ := line["type"].(string)
@@ -124,13 +123,13 @@ func captureLogTypes(lines []map[string]any) []string {
 	return out
 }
 
-// captureLogPeekLines reads the sink without closing it, tolerating the
+// tracePeekLines reads the sink without closing it, tolerating the
 // unterminated frame of the file still being written. It is how the tests that
 // go through the event bus wait for an asynchronously delivered record.
-func captureLogPeekLines(t *testing.T, dir string) []map[string]any {
+func tracePeekLines(t *testing.T, dir string) []map[string]any {
 	t.Helper()
 	var data []byte
-	for _, name := range captureLogFiles(t, dir) {
+	for _, name := range traceFiles(t, dir) {
 		f, err := os.Open(name)
 		if err != nil {
 			t.Fatalf("opening %s: %v", name, err)
@@ -148,52 +147,52 @@ func captureLogPeekLines(t *testing.T, dir string) []map[string]any {
 		}
 		data = append(data, chunk...)
 	}
-	return captureLogDecodeLines(t, data)
+	return traceDecodeLines(t, data)
 }
 
-// waitForCaptureLogTypes polls until the sink holds at least one record of
+// waitForTraceTypes polls until the sink holds at least one record of
 // kind. Event delivery is asynchronous (each event type has its own consumer
 // goroutine), so a test that emits on the bus has to wait for the record
 // rather than assume it is already there.
-func waitForCaptureLogTypes(t *testing.T, dir, kind string) []map[string]any {
+func waitForTraceTypes(t *testing.T, dir, kind string) []map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		lines := captureLogPeekLines(t, dir)
-		for _, got := range captureLogTypes(lines) {
+		lines := tracePeekLines(t, dir)
+		for _, got := range traceTypes(lines) {
 			if got == kind {
 				return lines
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no %q record reached the sink within the deadline; got %v", kind, captureLogTypes(lines))
+			t.Fatalf("no %q record reached the sink within the deadline; got %v", kind, traceTypes(lines))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// TestCaptureLog_RequestRecordCarriesRequestLine checks the three things a
+// TestTrace_RequestRecordCarriesRequestLine checks the three things a
 // request record needs to be reproducible beyond its bodies: the kind and
 // format version every consumer dispatches on, and the request line —
 // method, the target with its query string, and the client address.
-func TestCaptureLog_RequestRecordCarriesRequestLine(t *testing.T) {
-	mm, dir := captureLogSink(t, config.CaptureLogConfig{Enabled: true})
+func TestTrace_RequestRecordCarriesRequestLine(t *testing.T) {
+	mm, dir := traceSink(t, config.TraceConfig{Enabled: true})
 
 	r := postRequest("/v1/chat/completions?stream=true&n=2", "m", nil)
 	r.RemoteAddr = "192.0.2.7:51234"
 	copier := respond(t, http.StatusOK, "application/json", []byte(`{"usage":{"prompt_tokens":1}}`))
 	mm.record("m", r, copier, captureAll, []byte(`{"model":"m"}`), nil)
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 1 {
 		t.Fatalf("want 1 line, got %d", len(lines))
 	}
 	rec := lines[0]
-	if rec["type"] != captureLogTypeRequest {
-		t.Errorf("type = %v, want %q", rec["type"], captureLogTypeRequest)
+	if rec["type"] != traceTypeRequest {
+		t.Errorf("type = %v, want %q", rec["type"], traceTypeRequest)
 	}
-	if v, _ := rec["v"].(float64); int(v) != captureLogFormatVersion {
-		t.Errorf("v = %v, want %d", rec["v"], captureLogFormatVersion)
+	if v, _ := rec["v"].(float64); int(v) != traceFormatVersion {
+		t.Errorf("v = %v, want %d", rec["v"], traceFormatVersion)
 	}
 	if rec["method"] != http.MethodPost {
 		t.Errorf("method = %v, want POST", rec["method"])
@@ -208,11 +207,11 @@ func TestCaptureLog_RequestRecordCarriesRequestLine(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_RequestRecordUsesForwardedIP pins remote_ip to the same
+// TestTrace_RequestRecordUsesForwardedIP pins remote_ip to the same
 // resolution the in-flight view uses, so the same request reads the same in
 // both places.
-func TestCaptureLog_RequestRecordUsesForwardedIP(t *testing.T) {
-	mm, dir := captureLogSink(t, config.CaptureLogConfig{Enabled: true})
+func TestTrace_RequestRecordUsesForwardedIP(t *testing.T) {
+	mm, dir := traceSink(t, config.TraceConfig{Enabled: true})
 
 	r := postRequest("/v1/chat/completions", "m", nil)
 	r.RemoteAddr = "10.0.0.1:4000"
@@ -220,7 +219,7 @@ func TestCaptureLog_RequestRecordUsesForwardedIP(t *testing.T) {
 	copier := respond(t, http.StatusOK, "application/json", []byte(`{"usage":{"prompt_tokens":1}}`))
 	mm.record("m", r, copier, captureAll, nil, nil)
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 1 {
 		t.Fatalf("want 1 line, got %d", len(lines))
 	}
@@ -229,15 +228,15 @@ func TestCaptureLog_RequestRecordUsesForwardedIP(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_TraceIsOffByDefault is the switch: an enabled sink with no
+// TestTrace_StateIsOffByDefault is the switch: an enabled sink with no
 // trace settings records requests and nothing else. The state records carry
 // expanded command lines, environments and the effective configuration, so
 // turning the sink on must not start recording them.
-func TestCaptureLog_TraceIsOffByDefault(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	mm, dir := captureLogSinkWithState(t, config.CaptureLogConfig{Enabled: true}, stub.state)
+func TestTrace_StateIsOffByDefault(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	mm, dir := traceSinkWithState(t, config.TraceConfig{Enabled: true}, stub.state)
 
-	if mm.captureLogTrace != nil {
+	if mm.traceState != nil {
 		t.Fatal("no trace switch is set, so no tracer should exist")
 	}
 	event.Emit(swaputil.ProcessStateChangeEvent{ProcessName: "m", OldState: "stopped", NewState: "starting"})
@@ -247,26 +246,26 @@ func TestCaptureLog_TraceIsOffByDefault(t *testing.T) {
 	copier := respond(t, http.StatusOK, "application/json", []byte(`{"usage":{"prompt_tokens":1}}`))
 	mm.record("m", r, copier, captureAll, nil, nil)
 
-	types := captureLogTypes(captureLogRawLines(t, mm, dir))
-	if len(types) != 1 || types[0] != captureLogTypeRequest {
+	types := traceTypes(traceRawLines(t, mm, dir))
+	if len(types) != 1 || types[0] != traceTypeRequest {
 		t.Fatalf("record kinds = %v, want only a request record", types)
 	}
 }
 
-// TestCaptureLog_BackendTraceRecordsTransitions checks the backend record: one
+// TestTrace_BackendStateRecordsTransitions checks the backend record: one
 // line per process state transition, carrying the detail a request record
 // cannot — which command actually ran, with which environment, against which
 // upstream, since when.
 //
 // It goes through the real event bus, which is also the assertion that the
 // sink is subscribed to it rather than being called directly.
-func TestCaptureLog_BackendTraceRecordsTransitions(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Backend = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
-	if mm.captureLogTrace == nil {
-		t.Fatal("captureLog.trace.backend is set but no tracer was started")
+func TestTrace_BackendStateRecordsTransitions(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Backend = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
+	if mm.traceState == nil {
+		t.Fatal("trace.state.backend is set but no tracer was started")
 	}
 
 	event.Emit(swaputil.ProcessStateChangeEvent{
@@ -274,11 +273,11 @@ func TestCaptureLog_BackendTraceRecordsTransitions(t *testing.T) {
 		OldState:    string(process.StateStopped),
 		NewState:    string(process.StateStarting),
 	})
-	lines := waitForCaptureLogTypes(t, dir, captureLogTypeBackend)
+	lines := waitForTraceTypes(t, dir, traceTypeBackend)
 
 	var rec map[string]any
 	for _, line := range lines {
-		if line["type"] == captureLogTypeBackend {
+		if line["type"] == traceTypeBackend {
 			rec = line
 		}
 	}
@@ -318,22 +317,22 @@ func TestCaptureLog_BackendTraceRecordsTransitions(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_BackendTraceHasNoStartTimeBeforeStart is the other half of
+// TestTrace_BackendStateHasNoStartTimeBeforeStart is the other half of
 // the derived start time: it is observed from the event stream, so a process
 // whose start the sink did not see reports null rather than a guess.
-func TestCaptureLog_BackendTraceHasNoStartTimeBeforeStart(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Backend = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+func TestTrace_BackendStateHasNoStartTimeBeforeStart(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Backend = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m",
 		OldState:    string(process.StateReady),
 		NewState:    string(process.StateStopping),
 	})
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 1 {
 		t.Fatalf("want 1 line, got %d", len(lines))
 	}
@@ -343,27 +342,27 @@ func TestCaptureLog_BackendTraceHasNoStartTimeBeforeStart(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_ConfigTraceRecordsReloadBoundaries checks the reload markers.
+// TestTrace_ConfigStateRecordsReloadBoundaries checks the reload markers.
 // The configuration is hot-reloaded, so without them a reader would interpret
 // records under settings that had already been replaced. Both boundaries are
 // recorded: together they bracket the window in which either configuration
 // could have served a request.
-func TestCaptureLog_ConfigTraceRecordsReloadBoundaries(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Config = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+func TestTrace_ConfigStateRecordsReloadBoundaries(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Config = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
-	mm.captureLogTrace.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateStart})
-	mm.captureLogTrace.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
+	mm.traceState.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateStart})
+	mm.traceState.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 2 {
 		t.Fatalf("want 2 lines, got %d", len(lines))
 	}
-	for i, want := range []string{captureLogReloadStart, captureLogReloadEnd} {
-		if lines[i]["type"] != captureLogTypeConfig {
-			t.Fatalf("line %d type = %v, want %q", i, lines[i]["type"], captureLogTypeConfig)
+	for i, want := range []string{traceReloadStart, traceReloadEnd} {
+		if lines[i]["type"] != traceTypeConfig {
+			t.Fatalf("line %d type = %v, want %q", i, lines[i]["type"], traceTypeConfig)
 		}
 		reload, _ := lines[i]["config"].(map[string]any)
 		if reload["state"] != want {
@@ -372,16 +371,16 @@ func TestCaptureLog_ConfigTraceRecordsReloadBoundaries(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_CheckpointIsFirstLineOfEveryFile is the redundancy the
+// TestTrace_CheckpointIsFirstLineOfEveryFile is the redundancy the
 // checkpoint exists for. The trace is only readable from the beginning of the
 // stream, and rotation cuts the stream, so every file has to open with the
 // full state — not just the first one.
-func TestCaptureLog_CheckpointIsFirstLineOfEveryFile(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
+func TestTrace_CheckpointIsFirstLineOfEveryFile(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
 	stub.setRunning("m", string(process.StateReady))
-	cfg := config.CaptureLogConfig{Enabled: true, MaxFileBytes: 1024}
-	cfg.Trace.Checkpoint = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+	cfg := config.TraceConfig{Enabled: true, MaxFileBytes: 1024}
+	cfg.State.Checkpoint = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
 	// Incompressible bodies, so the 1 KiB threshold is crossed by the
 	// records themselves and several files come out.
@@ -399,42 +398,42 @@ func TestCaptureLog_CheckpointIsFirstLineOfEveryFile(t *testing.T) {
 	if err := mm.Close(); err != nil {
 		t.Fatalf("metricsMonitor.Close: %v", err)
 	}
-	names := captureLogFiles(t, dir)
+	names := traceFiles(t, dir)
 	if len(names) < 2 {
 		t.Fatalf("want more than one file at a 1 KiB threshold, got %v", names)
 	}
 	for _, name := range names {
-		lines := captureLogDecodeLines(t, decodeCaptureLogFile(t, name))
+		lines := traceDecodeLines(t, decodeTraceFile(t, name))
 		if len(lines) == 0 {
 			t.Fatalf("%s is empty", name)
 		}
-		if lines[0]["type"] != captureLogTypeCheckpoint {
+		if lines[0]["type"] != traceTypeCheckpoint {
 			t.Fatalf("%s starts with a %v record, want a checkpoint", name, lines[0]["type"])
 		}
 		for i, line := range lines[1:] {
-			if line["type"] == captureLogTypeCheckpoint {
+			if line["type"] == traceTypeCheckpoint {
 				t.Fatalf("%s has a second checkpoint at line %d", name, i+2)
 			}
 		}
 	}
 }
 
-// TestCaptureLog_CheckpointCarriesRunningStateAndConfig checks the contents of
+// TestTrace_CheckpointCarriesRunningStateAndConfig checks the contents of
 // the dump: the build that wrote the file, the active profile, every running
 // process with its expanded command, and the whole effective configuration.
-func TestCaptureLog_CheckpointCarriesRunningStateAndConfig(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
+func TestTrace_CheckpointCarriesRunningStateAndConfig(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
 	stub.setRunning("m", string(process.StateReady))
 	stub.profile = "evening"
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Checkpoint = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Checkpoint = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
 	r := postRequest("/v1/chat/completions", "m", nil)
 	copier := respond(t, http.StatusOK, "application/json", []byte(`{"usage":{"prompt_tokens":1}}`))
 	mm.record("m", r, copier, captureAll, nil, nil)
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 2 {
 		t.Fatalf("want a checkpoint and a request, got %d lines", len(lines))
 	}
@@ -476,17 +475,17 @@ func TestCaptureLog_CheckpointCarriesRunningStateAndConfig(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_TraceAndRequestsKeepOrder is the ordering contract. State
+// TestTrace_StateAndRequestsKeepOrder is the ordering contract. State
 // records arrive asynchronously but go through the same queue as the requests,
 // and a single writer goroutine owns the file, so the file is in the order the
 // records were produced. A backend record that landed after the requests it
 // describes would say the wrong thing about them.
-func TestCaptureLog_TraceAndRequestsKeepOrder(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Backend = true
-	cfg.Trace.Config = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+func TestTrace_StateAndRequestsKeepOrder(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Backend = true
+	cfg.State.Config = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
 	request := func() {
 		r := postRequest("/v1/chat/completions", "m", nil)
@@ -494,48 +493,48 @@ func TestCaptureLog_TraceAndRequestsKeepOrder(t *testing.T) {
 		mm.record("m", r, copier, captureAll, nil, nil)
 	}
 
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m", OldState: "stopped", NewState: "starting",
 	})
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m", OldState: "starting", NewState: "ready",
 	})
 	request()
 	request()
-	mm.captureLogTrace.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
+	mm.traceState.onConfigFileChanged(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
 	request()
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m", OldState: "ready", NewState: "stopping",
 	})
 
 	want := []string{
-		captureLogTypeBackend,
-		captureLogTypeBackend,
-		captureLogTypeRequest,
-		captureLogTypeRequest,
-		captureLogTypeConfig,
-		captureLogTypeRequest,
-		captureLogTypeBackend,
+		traceTypeBackend,
+		traceTypeBackend,
+		traceTypeRequest,
+		traceTypeRequest,
+		traceTypeConfig,
+		traceTypeRequest,
+		traceTypeBackend,
 	}
-	got := captureLogTypes(captureLogRawLines(t, mm, dir))
+	got := traceTypes(traceRawLines(t, mm, dir))
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("record order = %v, want %v", got, want)
 	}
 }
 
-// TestCaptureLog_MaskPathsRedactRecordFields checks maskPaths on both a
+// TestTrace_MaskPathsRedactRecordFields checks maskPaths on both a
 // request and a state record, and that everything it does not name is
 // untouched.
-func TestCaptureLog_MaskPathsRedactRecordFields(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{
+func TestTrace_MaskPathsRedactRecordFields(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{
 		Enabled:   true,
 		MaskPaths: []string{"backend.cmd", "req.headers.Authorization"},
 	}
-	cfg.Trace.Backend = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+	cfg.State.Backend = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m", OldState: "stopped", NewState: "starting",
 	})
 	r := postRequest("/v1/chat/completions", "m", nil)
@@ -545,7 +544,7 @@ func TestCaptureLog_MaskPathsRedactRecordFields(t *testing.T) {
 		"Content-Type":  "application/json",
 	})
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 2 {
 		t.Fatalf("want 2 lines, got %d", len(lines))
 	}
@@ -572,23 +571,23 @@ func TestCaptureLog_MaskPathsRedactRecordFields(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_MaskEnvRedactsByName checks the environment mask. An
+// TestTrace_MaskEnvRedactsByName checks the environment mask. An
 // environment is a list of "NAME=value" strings, so no JSON path can select
 // one entry; the name does it instead, and it reaches both the backend record
 // and the models inside the checkpoint's effective configuration.
-func TestCaptureLog_MaskEnvRedactsByName(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
+func TestTrace_MaskEnvRedactsByName(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
 	stub.setRunning("m", string(process.StateReady))
-	cfg := config.CaptureLogConfig{Enabled: true, MaskEnv: []string{"OPENAI_API_KEY"}}
-	cfg.Trace.Backend = true
-	cfg.Trace.Checkpoint = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+	cfg := config.TraceConfig{Enabled: true, MaskEnv: []string{"OPENAI_API_KEY"}}
+	cfg.State.Backend = true
+	cfg.State.Checkpoint = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
-	mm.captureLogTrace.onProcessStateChange(swaputil.ProcessStateChangeEvent{
+	mm.traceState.onProcessStateChange(swaputil.ProcessStateChangeEvent{
 		ProcessName: "m", OldState: "stopped", NewState: "starting",
 	})
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	if len(lines) != 2 {
 		t.Fatalf("want a checkpoint and a backend record, got %d lines", len(lines))
 	}
@@ -623,13 +622,13 @@ func TestCaptureLog_MaskEnvRedactsByName(t *testing.T) {
 	assertEnv("backend record", backend["env"])
 }
 
-// TestCaptureLog_MaskCannotReachBodies is the boundary. req.body and resp.body
+// TestTrace_MaskCannotReachBodies is the boundary. req.body and resp.body
 // are the bytes that went over the wire, kept verbatim, and that is the whole
 // point of the format — so a mask path naming one is refused rather than
 // applied, and the bodies come out byte-identical next to a field that was
 // masked.
-func TestCaptureLog_MaskCannotReachBodies(t *testing.T) {
-	cfg := config.CaptureLogConfig{
+func TestTrace_MaskCannotReachBodies(t *testing.T) {
+	cfg := config.TraceConfig{
 		Enabled: true,
 		MaskPaths: []string{
 			"req.body",
@@ -639,7 +638,7 @@ func TestCaptureLog_MaskCannotReachBodies(t *testing.T) {
 			"req.headers.Authorization",
 		},
 	}
-	mm, dir := captureLogSink(t, cfg)
+	mm, dir := traceSink(t, cfg)
 
 	// Key order and whitespace a JSON round trip would destroy, so a body
 	// that had been rewritten would not compare equal.
@@ -649,7 +648,7 @@ func TestCaptureLog_MaskCannotReachBodies(t *testing.T) {
 	copier := respond(t, http.StatusOK, "application/json", respBody)
 	mm.record("m", r, copier, captureAll, reqBody, map[string]string{"Authorization": "Bearer sk-live-1234"})
 
-	recs := readCaptureLog(t, mm, dir)
+	recs := readTrace(t, mm, dir)
 	if len(recs) != 1 {
 		t.Fatalf("want 1 line, got %d", len(recs))
 	}
@@ -666,31 +665,31 @@ func TestCaptureLog_MaskCannotReachBodies(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_MaskRefusesBodyPaths pins which paths are refused, at the
+// TestTrace_MaskRefusesBodyPaths pins which paths are refused, at the
 // level where the decision is made.
-func TestCaptureLog_MaskRefusesBodyPaths(t *testing.T) {
+func TestTrace_MaskRefusesBodyPaths(t *testing.T) {
 	refused := []string{"req.body", "resp.body", "req.body.messages", "req", "resp"}
 	for _, path := range refused {
-		if _, bad := captureLogMaskRefusal(path); !bad {
+		if _, bad := traceMaskRefusal(path); !bad {
 			t.Errorf("%q should be refused: it would rewrite a verbatim body", path)
 		}
 	}
 	allowed := []string{"req.headers.Authorization", "resp.headers.Set-Cookie", "backend.cmd", "checkpoint.config", "req.body_bytes"}
 	for _, path := range allowed {
-		if reason, bad := captureLogMaskRefusal(path); bad {
+		if reason, bad := traceMaskRefusal(path); bad {
 			t.Errorf("%q should be allowed, refused with %q", path, reason)
 		}
 	}
 }
 
-// TestCaptureLog_MaskIsEmptyByDefault is the default: everything is recorded
+// TestTrace_MaskIsEmptyByDefault is the default: everything is recorded
 // and nothing is masked, so an operator who configures nothing gets the full
 // record rather than a silently filtered one.
-func TestCaptureLog_MaskIsEmptyByDefault(t *testing.T) {
-	if mask := newCaptureLogMask(config.CaptureLogConfig{Enabled: true}, nil); mask != nil {
+func TestTrace_MaskIsEmptyByDefault(t *testing.T) {
+	if mask := newTraceMask(config.TraceConfig{Enabled: true}, nil); mask != nil {
 		t.Fatalf("an unconfigured mask should be nil, got %+v", mask)
 	}
-	var nilMask *captureLogMask
+	var nilMask *traceMask
 	line := []byte(`{"req":{"headers":{"Authorization":"secret"}}}` + "\n")
 	if got := nilMask.applyPaths(line); !bytes.Equal(got, line) {
 		t.Errorf("a nil mask changed the line: %s", got)
@@ -700,23 +699,23 @@ func TestCaptureLog_MaskIsEmptyByDefault(t *testing.T) {
 	}
 }
 
-// TestCaptureLog_CheckpointConfigIsRedactedAndWhole covers the two halves of
+// TestTrace_CheckpointConfigIsRedactedAndWhole covers the two halves of
 // RedactedFullYAML at once: llama-swap's own redaction reaches secrets that
 // maskPaths cannot (this one is inside an env entry, and nothing was
 // configured to be masked here), while the pruning RedactedYAML does for
 // readability is not applied, so a key whose resolved value is empty is still
 // on the record.
-func TestCaptureLog_CheckpointConfigIsRedactedAndWhole(t *testing.T) {
-	stub := newCaptureLogStateStub(t, captureLogTestConfig)
-	cfg := config.CaptureLogConfig{Enabled: true}
-	cfg.Trace.Checkpoint = true
-	mm, dir := captureLogSinkWithState(t, cfg, stub.state)
+func TestTrace_CheckpointConfigIsRedactedAndWhole(t *testing.T) {
+	stub := newTraceStateStub(t, traceTestConfig)
+	cfg := config.TraceConfig{Enabled: true}
+	cfg.State.Checkpoint = true
+	mm, dir := traceSinkWithState(t, cfg, stub.state)
 
 	r := postRequest("/v1/chat/completions", "m", nil)
 	copier := respond(t, http.StatusOK, "application/json", []byte(`{}`))
 	mm.record("m", r, copier, captureAll, nil, nil)
 
-	lines := captureLogRawLines(t, mm, dir)
+	lines := traceRawLines(t, mm, dir)
 	raw, err := json.Marshal(lines[0])
 	if err != nil {
 		t.Fatalf("re-encoding the checkpoint: %v", err)
@@ -733,14 +732,14 @@ func TestCaptureLog_CheckpointConfigIsRedactedAndWhole(t *testing.T) {
 	if effective == nil {
 		t.Fatalf("checkpoint has no effective configuration: %v", lines[0])
 	}
-	if !captureLogHasEmptyValue(effective) {
+	if !traceHasEmptyValue(effective) {
 		t.Errorf("no empty value survived in the effective configuration; it looks pruned")
 	}
 }
 
-// captureLogHasEmptyValue reports whether any leaf in the tree is nil, an
+// traceHasEmptyValue reports whether any leaf in the tree is nil, an
 // empty string, an empty map or an empty slice — the shapes pruneEmpty drops.
-func captureLogHasEmptyValue(node any) bool {
+func traceHasEmptyValue(node any) bool {
 	switch t := node.(type) {
 	case nil:
 		return true
@@ -751,7 +750,7 @@ func captureLogHasEmptyValue(node any) bool {
 			return true
 		}
 		for _, v := range t {
-			if captureLogHasEmptyValue(v) {
+			if traceHasEmptyValue(v) {
 				return true
 			}
 		}
@@ -760,7 +759,7 @@ func captureLogHasEmptyValue(node any) bool {
 			return true
 		}
 		for _, v := range t {
-			if captureLogHasEmptyValue(v) {
+			if traceHasEmptyValue(v) {
 				return true
 			}
 		}

@@ -44,14 +44,14 @@ type metricsMonitor struct {
 	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
-	// captureLog is the optional write-only JSONL sink (see capturelog.go).
-	// It is nil when disabled and is deliberately not part of the capture
-	// ring: it neither reads from nor writes to captureCache.
-	captureLog *captureLogWriter
-	// captureLogTrace subscribes the sink to the process-wide event bus so
-	// the log also says which backend answered and under which
-	// configuration. Nil unless one of captureLog.trace.* is on.
-	captureLogTrace *captureLogTracer
+	// trace is the optional write-only JSONL sink (see trace.go). It is nil
+	// when disabled, and it is a separate output from the capture ring above:
+	// it neither reads from nor writes to captureCache.
+	trace *traceWriter
+	// traceState subscribes the trace to the process-wide event bus so it
+	// also says which backend answered and under which configuration. Nil
+	// unless one of trace.state.* is on.
+	traceState *traceStateTracer
 }
 
 func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
@@ -120,46 +120,46 @@ func (mp *metricsMonitor) debugf(format string, args ...any) {
 	}
 }
 
-// attachCaptureLog starts the JSONL capture sink described by cfg. It is a
-// no-op when the sink is disabled, leaving mp.captureLog nil.
+// attachTrace starts the JSONL trace described by cfg. It is a no-op when the
+// trace is disabled, leaving mp.trace nil.
 //
-// state is the seam to process management, used by the trace and checkpoint
-// records; a nil one disables them. The order here is forced: the writer needs
+// state is the seam to process management, used by the state records; a nil
+// one disables them. The order here is forced: the writer needs
 // the tracer's checkpoint renderer to open its first file, and the tracer must
 // not start emitting before the writer it emits into exists.
-func (mp *metricsMonitor) attachCaptureLog(cfg config.CaptureLogConfig, state captureLogStateFunc) {
-	mask := newCaptureLogMask(cfg, mp.logger)
-	tracer := newCaptureLogTracer(cfg, mask, state, mp.logger)
+func (mp *metricsMonitor) attachTrace(cfg config.TraceConfig, state traceStateFunc) {
+	mask := newTraceMask(cfg, mp.logger)
+	tracer := newTraceStateTracer(cfg, mask, state, mp.logger)
 	var checkpoint func(time.Time) []byte
 	if tracer != nil {
 		checkpoint = tracer.checkpointLine
 	}
-	writer := newCaptureLogWriter(cfg, mp.logger, mask, checkpoint)
+	writer := newTraceWriter(cfg, mp.logger, mask, checkpoint)
 	if writer == nil {
 		return
 	}
-	mp.captureLog = writer
-	mp.captureLogTrace = tracer
+	mp.trace = writer
+	mp.traceState = tracer
 	tracer.start(writer)
 }
 
 // wantsRequestCapture reports whether the request body/headers must be
-// buffered before dispatch. The capture ring is one consumer; the JSONL sink
+// buffered before dispatch. The capture ring is one consumer; the JSONL trace
 // is the other, and it works with captureBuffer set to 0.
 func (mp *metricsMonitor) wantsRequestCapture() bool {
-	return mp.enableCaptures || mp.captureLog != nil
+	return mp.enableCaptures || mp.trace != nil
 }
 
 // Close releases the monitor's resources. Wired into Server.Shutdown so the
-// capture log is flushed and closed on a graceful stop.
+// trace is flushed and closed on a graceful stop.
 //
 // The event subscriptions go first: they are process-wide, so a retired
 // Server that kept them would go on writing state records into a sink that is
 // draining. The sink is closed second, which lets a record an in-flight event
 // already queued still reach the file.
 func (mp *metricsMonitor) Close() error {
-	mp.captureLogTrace.Close()
-	return mp.captureLog.Close()
+	mp.traceState.Close()
+	return mp.trace.Close()
 }
 
 // activitySource returns connection metadata for activity records. It
@@ -232,7 +232,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		// The JSONL sink can record what the ring deliberately does not: the
 		// request of an abandoned call. Opt-in (includeAborted), and the sink
 		// drops it otherwise, so the ring's #1029 behaviour is unchanged.
-		mp.writeCaptureLog(captureLogEvent{
+		mp.writeTrace(traceEvent{
 			outcome:    outcomeClientDisconnected,
 			tm:         tm,
 			r:          r,
@@ -261,7 +261,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		// ring nothing has to render it. It is passed the route's own mask,
 		// not the ring's extra &^captureRespBody, so a route that keeps
 		// response bodies keeps this one too.
-		mp.writeCaptureLog(captureLogEvent{
+		mp.writeTrace(traceEvent{
 			outcome:    outcomeUpstreamError,
 			tm:         tm,
 			r:          r,
@@ -283,7 +283,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		// until now it left no JSONL line at all. A sink where a missing line
 		// can mean "it worked" is unusable for reconstructing traffic, so the
 		// line goes out with an empty response body.
-		mp.writeCaptureLog(captureLogEvent{
+		mp.writeTrace(traceEvent{
 			outcome:    successOutcome(r),
 			tm:         tm,
 			r:          r,
@@ -306,7 +306,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 			// they are the only evidence of what the upstream actually sent.
 			// They go out as they arrived (respIsWire), so Content-Encoding
 			// stays on the record and the body is base64.
-			mp.writeCaptureLog(captureLogEvent{
+			mp.writeTrace(traceEvent{
 				outcome:    successOutcome(r),
 				tm:         tm,
 				r:          r,
@@ -360,7 +360,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 	tm = stored
 	tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf, reqBody, reqHeaders, body)
-	mp.writeCaptureLog(captureLogEvent{
+	mp.writeTrace(traceEvent{
 		outcome:    successOutcome(r),
 		tm:         tm,
 		r:          r,
@@ -383,7 +383,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 // same reason MarkClientClosed uses it: middleware derive cancellable children
 // (the inflight tracker's operator cancel, the peer router's shutdown link),
 // and a request killed server-side still had a live client.
-func successOutcome(r *http.Request) captureLogOutcome {
+func successOutcome(r *http.Request) traceOutcome {
 	if swaputil.ClientContext(r.Context()).Err() != nil {
 		return outcomeClientDisconnectedMidStream
 	}

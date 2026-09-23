@@ -21,7 +21,7 @@ import (
 // cannot be used to reproduce the inference. The state records fill that in,
 // and they come in two shapes for two different failure modes:
 //
-//   - The trace is the primary form. The process-wide event bus
+//   - The event record is the primary form. The process-wide event bus
 //     (internal/swaputil/events.go) already carries every process state
 //     transition and every configuration reload, so subscribing to it puts a
 //     record in the stream at the moment the fact changed, interleaved with
@@ -29,17 +29,17 @@ import (
 //     exists: without a marker, records written before a reload would be read
 //     under a configuration that no longer applied to them.
 //
-//   - The checkpoint is the redundancy. The trace only works if the reader
-//     has every line since the process started, and rotation breaks exactly
-//     that: a file opened an hour in begins in the middle. Each file
+//   - The checkpoint is the redundancy. An event record only works if the
+//     reader has every line since the process started, and rotation breaks
+//     exactly that: a file opened an hour in begins in the middle. Each file
 //     therefore opens with a full state dump, so it can be interpreted
 //     without the files before it.
 //
-// Both are opt-in (captureLog.trace.*) and off by default, because they carry
+// Both are opt-in (trace.state.*) and off by default, because they carry
 // the expanded command lines, environments and effective configuration that
 // make the log reproducible — and that is also what makes it sensitive.
 
-// captureLogProcessDetail is what a record has to carry for a backend to be
+// traceProcessDetail is what a record has to carry for a backend to be
 // reproducible: the command as it will actually be executed, its environment,
 // the upstream address llama-swap proxies to, and when it started.
 //
@@ -47,7 +47,7 @@ import (
 // --port ${PORT} --model ${MODEL_ID}"), macros are expanded while the
 // configuration is loaded, and this is the argv that reaches exec.Command —
 // the same value process.doStart builds, via the same ModelConfig method.
-type captureLogProcessDetail struct {
+type traceProcessDetail struct {
 	Cmd []string `json:"cmd"`
 	// CmdError is set instead of Cmd when the command cannot be split into an
 	// argv (an unbalanced quote, say). The process would fail to start with
@@ -62,50 +62,50 @@ type captureLogProcessDetail struct {
 	StartedAt *string `json:"started_at"`
 }
 
-// captureLogBackendRecord is one process state transition.
-type captureLogBackendRecord struct {
-	Type    string            `json:"type"`
-	V       int               `json:"v"`
-	TS      string            `json:"ts"`
-	Backend captureLogBackend `json:"backend"`
+// traceBackendRecord is one process state transition.
+type traceBackendRecord struct {
+	Type    string       `json:"type"`
+	V       int          `json:"v"`
+	TS      string       `json:"ts"`
+	Backend traceBackend `json:"backend"`
 }
 
-type captureLogBackend struct {
+type traceBackend struct {
 	ProcessName string `json:"process_name"`
 	OldState    string `json:"old_state"`
 	NewState    string `json:"new_state"`
-	captureLogProcessDetail
+	traceProcessDetail
 }
 
-// captureLogConfigRecord marks a configuration reload boundary.
-type captureLogConfigRecord struct {
-	Type   string           `json:"type"`
-	V      int              `json:"v"`
-	TS     string           `json:"ts"`
-	Config captureLogReload `json:"config"`
+// traceConfigRecord marks a configuration reload boundary.
+type traceConfigRecord struct {
+	Type   string      `json:"type"`
+	V      int         `json:"v"`
+	TS     string      `json:"ts"`
+	Config traceReload `json:"config"`
 }
 
-type captureLogReload struct {
+type traceReload struct {
 	State string `json:"state"`
 }
 
 const (
-	captureLogReloadStart = "reloading_start"
-	captureLogReloadEnd   = "reloading_end"
+	traceReloadStart = "reloading_start"
+	traceReloadEnd   = "reloading_end"
 )
 
-// captureLogCheckpointRecord is the state dump at the head of a file.
-type captureLogCheckpointRecord struct {
-	Type       string               `json:"type"`
-	V          int                  `json:"v"`
-	TS         string               `json:"ts"`
-	Checkpoint captureLogCheckpoint `json:"checkpoint"`
+// traceCheckpointRecord is the state dump at the head of a file.
+type traceCheckpointRecord struct {
+	Type       string          `json:"type"`
+	V          int             `json:"v"`
+	TS         string          `json:"ts"`
+	Checkpoint traceCheckpoint `json:"checkpoint"`
 }
 
-type captureLogCheckpoint struct {
-	Build     captureLogBuild               `json:"llama_swap"`
-	Profile   string                        `json:"profile"`
-	Processes []captureLogCheckpointProcess `json:"processes"`
+type traceCheckpoint struct {
+	Build     traceBuild               `json:"llama_swap"`
+	Profile   string                   `json:"profile"`
+	Processes []traceCheckpointProcess `json:"processes"`
 	// Config is the effective configuration, whole. It is written once per
 	// file rather than once per record, so its size does not matter, and
 	// without it a reader has to be told out of band what the settings were.
@@ -114,37 +114,37 @@ type captureLogCheckpoint struct {
 	ConfigError string `json:"config_error,omitempty"`
 }
 
-// captureLogBuild identifies the llama-swap that wrote the file. The values
+// traceBuild identifies the llama-swap that wrote the file. The values
 // are the ones GET /api/version reports: they come from ldflags, so a build
 // that set none says version "0".
-type captureLogBuild struct {
+type traceBuild struct {
 	Version string `json:"version"`
 	Commit  string `json:"commit"`
 	Date    string `json:"date"`
 }
 
-type captureLogCheckpointProcess struct {
+type traceCheckpointProcess struct {
 	ProcessName string `json:"process_name"`
 	State       string `json:"state"`
-	captureLogProcessDetail
+	traceProcessDetail
 }
 
-// captureLogServerState is the seam between the sink and process management.
-// attachCaptureLog is handed one of these functions at construction; the
+// traceServerState is the seam between the sink and process management.
+// attachTrace is handed one of these functions at construction; the
 // tracer calls it on its own goroutines (at construction and on each event)
 // and publishes the result as a snapshot, so the writer goroutine only ever
 // reads already-materialized data. Nothing the writer does can block on a
 // router lock or on a process that is busy starting.
-type captureLogStateFunc func() captureLogServerState
+type traceStateFunc func() traceServerState
 
-type captureLogServerState struct {
-	Build   captureLogBuild
+type traceServerState struct {
+	Build   traceBuild
 	Profile string
 	// Running is every process that is not stopped, keyed by process name.
 	Running map[string]string
 	// Models is the configured detail for every model, whether running or
 	// not, keyed by the same name.
-	Models map[string]captureLogProcessDetail
+	Models map[string]traceProcessDetail
 	// ConfigYAML renders the effective configuration in its configured form
 	// (YAML key names, macros expanded). It is a function because it is only
 	// needed when checkpoints are on, and the result is cached by the tracer:
@@ -153,17 +153,17 @@ type captureLogServerState struct {
 	ConfigYAML func() ([]byte, error)
 }
 
-// captureLogSnapshot is the materialized state a checkpoint is rendered from.
+// traceSnapshot is the materialized state a checkpoint is rendered from.
 // It is published as an immutable value and swapped atomically.
-type captureLogSnapshot struct {
-	build       captureLogBuild
+type traceSnapshot struct {
+	build       traceBuild
 	profile     string
-	processes   []captureLogCheckpointProcess
+	processes   []traceCheckpointProcess
 	config      json.RawMessage
 	configError string
 }
 
-// captureLogTracer subscribes the sink to the process-wide event bus and keeps
+// traceStateTracer subscribes the sink to the process-wide event bus and keeps
 // the checkpoint snapshot current.
 //
 // Its records go into the sink through the same queue as the request records,
@@ -171,17 +171,17 @@ type captureLogSnapshot struct {
 // There is deliberately no second path to the file: two writers would
 // interleave lines, and a "state as of" record that can land after the
 // requests it describes is worse than none.
-type captureLogTracer struct {
-	trace  config.CaptureLogTraceConfig
-	mask   *captureLogMask
-	state  captureLogStateFunc
+type traceStateTracer struct {
+	cfg    config.TraceStateConfig
+	mask   *traceMask
+	state  traceStateFunc
 	logger *logmon.Monitor
 
-	snapshot atomic.Pointer[captureLogSnapshot]
+	snapshot atomic.Pointer[traceSnapshot]
 
 	// sink is nil until start; checkpointLine never reads it, so the writer
 	// can be handed that method before the sink exists.
-	sink *captureLogWriter
+	sink *traceWriter
 
 	// mu guards startedAt and serializes refreshes. Each event type is
 	// delivered on its own goroutine, so the handlers run concurrently with
@@ -199,18 +199,18 @@ type captureLogTracer struct {
 	cancels []context.CancelFunc
 }
 
-// newCaptureLogTracer builds the tracer for cfg, or returns nil when no state
+// newTraceStateTracer builds the tracer for cfg, or returns nil when no state
 // record is enabled. It takes an initial snapshot but subscribes to nothing;
 // start does that, once the sink it emits into exists.
-func newCaptureLogTracer(cfg config.CaptureLogConfig, mask *captureLogMask, state captureLogStateFunc, logger *logmon.Monitor) *captureLogTracer {
+func newTraceStateTracer(cfg config.TraceConfig, mask *traceMask, state traceStateFunc, logger *logmon.Monitor) *traceStateTracer {
 	if !cfg.Enabled || state == nil {
 		return nil
 	}
-	if !cfg.Trace.Backend && !cfg.Trace.Config && !cfg.Trace.Checkpoint {
+	if !cfg.State.Backend && !cfg.State.Config && !cfg.State.Checkpoint {
 		return nil
 	}
-	t := &captureLogTracer{
-		trace:     cfg.Trace,
+	t := &traceStateTracer{
+		cfg:       cfg.State,
 		mask:      mask,
 		state:     state,
 		logger:    logger,
@@ -225,15 +225,15 @@ func newCaptureLogTracer(cfg config.CaptureLogConfig, mask *captureLogMask, stat
 // are process-wide (the dispatcher is a package-level default), which is why
 // Close has to cancel them: a hot reload builds a new Server, and a retired
 // tracer that kept listening would keep writing into a sink that is closing.
-func (t *captureLogTracer) start(sink *captureLogWriter) {
+func (t *traceStateTracer) start(sink *traceWriter) {
 	if t == nil {
 		return
 	}
 	t.sink = sink
-	if t.trace.Backend || t.trace.Checkpoint {
+	if t.cfg.Backend || t.cfg.Checkpoint {
 		t.cancels = append(t.cancels, event.On(t.onProcessStateChange))
 	}
-	if t.trace.Config || t.trace.Checkpoint {
+	if t.cfg.Config || t.cfg.Checkpoint {
 		t.cancels = append(t.cancels, event.On(t.onConfigFileChanged))
 	}
 }
@@ -241,7 +241,7 @@ func (t *captureLogTracer) start(sink *captureLogWriter) {
 // Close unsubscribes. It does not touch the sink: the sink's own Close drains
 // and finishes the file, and it must run after this so a record produced by a
 // last in-flight event is still written.
-func (t *captureLogTracer) Close() {
+func (t *traceStateTracer) Close() {
 	if t == nil {
 		return
 	}
@@ -255,7 +255,7 @@ func (t *captureLogTracer) Close() {
 // Both happen for every transition even when only one of the two switches is
 // on, because a checkpoint written from a stale snapshot is a wrong record
 // rather than a missing one.
-func (t *captureLogTracer) onProcessStateChange(e swaputil.ProcessStateChangeEvent) {
+func (t *traceStateTracer) onProcessStateChange(e swaputil.ProcessStateChangeEvent) {
 	now := time.Now()
 	t.mu.Lock()
 	// The start time is observed here because process management does not
@@ -271,18 +271,18 @@ func (t *captureLogTracer) onProcessStateChange(e swaputil.ProcessStateChangeEve
 	started := t.startedAtLocked(e.ProcessName)
 	t.mu.Unlock()
 
-	if t.trace.Backend {
+	if t.cfg.Backend {
 		detail := t.detailFor(e.ProcessName)
 		detail.StartedAt = started
-		t.emit(&captureLogBackendRecord{
-			Type: captureLogTypeBackend,
-			V:    captureLogFormatVersion,
-			TS:   now.Format(captureLogTimeFormat),
-			Backend: captureLogBackend{
-				ProcessName:             e.ProcessName,
-				OldState:                e.OldState,
-				NewState:                e.NewState,
-				captureLogProcessDetail: detail,
+		t.emit(&traceBackendRecord{
+			Type: traceTypeBackend,
+			V:    traceFormatVersion,
+			TS:   now.Format(traceTimeFormat),
+			Backend: traceBackend{
+				ProcessName:        e.ProcessName,
+				OldState:           e.OldState,
+				NewState:           e.NewState,
+				traceProcessDetail: detail,
 			},
 		})
 	}
@@ -292,17 +292,17 @@ func (t *captureLogTracer) onProcessStateChange(e swaputil.ProcessStateChangeEve
 // onConfigFileChanged writes one record per reload boundary. Both boundaries
 // are recorded: the pair brackets the window in which requests may have been
 // served by either configuration.
-func (t *captureLogTracer) onConfigFileChanged(e swaputil.ConfigFileChangedEvent) {
-	state := captureLogReloadEnd
+func (t *traceStateTracer) onConfigFileChanged(e swaputil.ConfigFileChangedEvent) {
+	state := traceReloadEnd
 	if e.State == swaputil.ReloadingStateStart {
-		state = captureLogReloadStart
+		state = traceReloadStart
 	}
-	if t.trace.Config {
-		t.emit(&captureLogConfigRecord{
-			Type:   captureLogTypeConfig,
-			V:      captureLogFormatVersion,
-			TS:     time.Now().Format(captureLogTimeFormat),
-			Config: captureLogReload{State: state},
+	if t.cfg.Config {
+		t.emit(&traceConfigRecord{
+			Type:   traceTypeConfig,
+			V:      traceFormatVersion,
+			TS:     time.Now().Format(traceTimeFormat),
+			Config: traceReload{State: state},
 		})
 	}
 	t.refresh()
@@ -311,14 +311,14 @@ func (t *captureLogTracer) onConfigFileChanged(e swaputil.ConfigFileChangedEvent
 // emit encodes, masks and queues one record. It goes through the sink's
 // ordinary non-blocking write, so a tracer that cannot keep up drops records
 // and is counted with the rest rather than stalling the event bus.
-func (t *captureLogTracer) emit(rec any) {
+func (t *traceStateTracer) emit(rec any) {
 	if t.sink == nil {
 		return
 	}
-	line, err := encodeCaptureLogRecord(rec)
+	line, err := encodeTraceRecord(rec)
 	if err != nil {
 		if t.logger != nil {
-			t.logger.Warnf("capture log: encoding a state record failed: %v", err)
+			t.logger.Warnf("trace: encoding a state record failed: %v", err)
 		}
 		return
 	}
@@ -329,19 +329,19 @@ func (t *captureLogTracer) emit(rec any) {
 // checkpoints are off. This is the function the writer goroutine calls, and it
 // only reads the published snapshot: no lock of process management is taken
 // here, and nothing it does can block on a process that is busy starting.
-func (t *captureLogTracer) checkpointLine(now time.Time) []byte {
-	if t == nil || !t.trace.Checkpoint {
+func (t *traceStateTracer) checkpointLine(now time.Time) []byte {
+	if t == nil || !t.cfg.Checkpoint {
 		return nil
 	}
 	snap := t.snapshot.Load()
 	if snap == nil {
 		return nil
 	}
-	line, err := encodeCaptureLogRecord(&captureLogCheckpointRecord{
-		Type: captureLogTypeCheckpoint,
-		V:    captureLogFormatVersion,
-		TS:   now.Format(captureLogTimeFormat),
-		Checkpoint: captureLogCheckpoint{
+	line, err := encodeTraceRecord(&traceCheckpointRecord{
+		Type: traceTypeCheckpoint,
+		V:    traceFormatVersion,
+		TS:   now.Format(traceTimeFormat),
+		Checkpoint: traceCheckpoint{
 			Build:       snap.build,
 			Profile:     snap.profile,
 			Processes:   snap.processes,
@@ -351,7 +351,7 @@ func (t *captureLogTracer) checkpointLine(now time.Time) []byte {
 	})
 	if err != nil {
 		if t.logger != nil {
-			t.logger.Warnf("capture log: encoding the checkpoint failed: %v", err)
+			t.logger.Warnf("trace: encoding the checkpoint failed: %v", err)
 		}
 		return nil
 	}
@@ -360,8 +360,8 @@ func (t *captureLogTracer) checkpointLine(now time.Time) []byte {
 
 // refresh re-reads process management and publishes a new snapshot. It runs on
 // the tracer's goroutines only.
-func (t *captureLogTracer) refresh() {
-	if !t.trace.Checkpoint {
+func (t *traceStateTracer) refresh() {
+	if !t.cfg.Checkpoint {
 		return
 	}
 	state := t.state()
@@ -374,19 +374,19 @@ func (t *captureLogTracer) refresh() {
 	sort.Strings(names)
 
 	t.mu.Lock()
-	processes := make([]captureLogCheckpointProcess, 0, len(names))
+	processes := make([]traceCheckpointProcess, 0, len(names))
 	for _, name := range names {
 		detail := t.maskedDetail(state.Models[name])
 		detail.StartedAt = t.startedAtLocked(name)
-		processes = append(processes, captureLogCheckpointProcess{
-			ProcessName:             name,
-			State:                   state.Running[name],
-			captureLogProcessDetail: detail,
+		processes = append(processes, traceCheckpointProcess{
+			ProcessName:        name,
+			State:              state.Running[name],
+			traceProcessDetail: detail,
 		})
 	}
 	t.mu.Unlock()
 
-	t.snapshot.Store(&captureLogSnapshot{
+	t.snapshot.Store(&traceSnapshot{
 		build:       state.Build,
 		profile:     state.Profile,
 		processes:   processes,
@@ -398,23 +398,23 @@ func (t *captureLogTracer) refresh() {
 // detailFor looks up one model's configured detail, masked. A name with no
 // model (a process the configuration no longer has) yields an empty detail
 // rather than nothing, so the record still says which process changed.
-func (t *captureLogTracer) detailFor(name string) captureLogProcessDetail {
+func (t *traceStateTracer) detailFor(name string) traceProcessDetail {
 	return t.maskedDetail(t.state().Models[name])
 }
 
-func (t *captureLogTracer) maskedDetail(detail captureLogProcessDetail) captureLogProcessDetail {
+func (t *traceStateTracer) maskedDetail(detail traceProcessDetail) traceProcessDetail {
 	detail.Env = t.mask.maskEnv(detail.Env)
 	return detail
 }
 
 // startedAtLocked formats the observed start time, or nil when the process
 // started before this sink was watching. t.mu must be held.
-func (t *captureLogTracer) startedAtLocked(name string) *string {
+func (t *traceStateTracer) startedAtLocked(name string) *string {
 	started, ok := t.startedAt[name]
 	if !ok {
 		return nil
 	}
-	text := started.Format(captureLogTimeFormat)
+	text := started.Format(traceTimeFormat)
 	return &text
 }
 
@@ -427,7 +427,7 @@ func (t *captureLogTracer) startedAtLocked(name string) *string {
 // The intermediate generic value is also where maskEnv reaches the models'
 // environments, which no JSON path could select (the name is inside the
 // "NAME=value" string).
-func (t *captureLogTracer) renderConfig() (json.RawMessage, string) {
+func (t *traceStateTracer) renderConfig() (json.RawMessage, string) {
 	state := t.state()
 	if state.ConfigYAML == nil {
 		return nil, "no configuration source"
@@ -448,7 +448,7 @@ func (t *captureLogTracer) renderConfig() (json.RawMessage, string) {
 	return out, ""
 }
 
-// captureLogState is the Server's side of the seam above: everything the
+// traceState is the Server's side of the seam above: everything the
 // state records need that lives outside internal/server's sink.
 //
 // It is deliberately a plain read of already-resolved values. cfg is the
@@ -456,16 +456,16 @@ func (t *captureLogTracer) renderConfig() (json.RawMessage, string) {
 // ${env.*}) are expanded while it is loaded, and a hot reload builds a new
 // Server rather than mutating this one — so the command and upstream here are
 // the ones the process actually runs with.
-func (s *Server) captureLogState() captureLogServerState {
-	state := captureLogServerState{
-		Build: captureLogBuild{
+func (s *Server) traceState() traceServerState {
+	state := traceServerState{
+		Build: traceBuild{
 			Version: s.build.Version,
 			Commit:  s.build.Commit,
 			Date:    s.build.Date,
 		},
 		Profile: s.ActiveProfile(),
 		Running: make(map[string]string),
-		Models:  captureLogModelDetails(s.cfg),
+		Models:  traceModelDetails(s.cfg),
 		// Redacted rather than marshaled raw: the checkpoint is the one record
 		// that carries the whole configuration, and llama-swap already knows
 		// which of its own fields are credentials — including the secret
@@ -482,13 +482,13 @@ func (s *Server) captureLogState() captureLogServerState {
 	return state
 }
 
-// captureLogModelDetails renders every configured model's reproducible
+// traceModelDetails renders every configured model's reproducible
 // detail. SanitizedCommand is the same call process.doStart makes, so the argv
 // recorded is the argv executed rather than a second parse of the same string.
-func captureLogModelDetails(cfg config.Config) map[string]captureLogProcessDetail {
-	details := make(map[string]captureLogProcessDetail, len(cfg.Models))
+func traceModelDetails(cfg config.Config) map[string]traceProcessDetail {
+	details := make(map[string]traceProcessDetail, len(cfg.Models))
 	for id, model := range cfg.Models {
-		detail := captureLogProcessDetail{
+		detail := traceProcessDetail{
 			Env:      model.Env,
 			Upstream: model.Proxy,
 		}

@@ -3,7 +3,7 @@ title: Observability, storage and Activity
 summary: Use logs, metrics, captures and the Activity view to diagnose requests and retain useful history.
 category: guides
 tags: [operations, logs, metrics, activity, captures]
-config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer, captureLog]
+config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer, trace]
 updated: 2026-09-23
 ---
 
@@ -28,14 +28,14 @@ an issue.
 
 `captureBuffer` keeps recent captures in memory for the Activity page, so old
 requests fall out of the ring and failed responses keep only an error message.
-When you need the full history instead, enable `captureLog`: it writes one
+When you need the full history instead, enable `trace`: it writes one
 self-contained JSON object per metered request into a directory of
-zstd-compressed files, independent of `captureBuffer`.
+zstd-compressed files.
 
 ```yaml
-captureLog:
+trace:
   enabled: true
-  dir: /var/log/llama-swap/captures
+  dir: /var/log/llama-swap/trace
   maxFileBytes: 268435456
   level: 3
   includeAborted: false
@@ -57,12 +57,12 @@ llama-swap does not store those in the capture ring either. Their lines carry
 never looks like a request that had no body.
 
 `dir` is created if missing. Files are named
-`captures-<timestamp>.jsonl.zst`, the name is fixed when the file is created,
+`trace-<timestamp>.jsonl.zst`, the name is fixed when the file is created,
 and llama-swap never renames or reopens one: a file that is no longer the
 newest is finished and safe to copy away. Each file is a complete zstd stream
-on its own, so `zstd -d captures-20260923T123000+0900.jsonl.zst` works without
+on its own, so `zstd -d trace-20260923T123000+0900.jsonl.zst` works without
 the rest of the directory, and the names sort in the order they were written,
-so `zstd -dc captures-*.jsonl.zst` replays the whole history in order.
+so `zstd -dc trace-*.jsonl.zst` replays the whole history in order.
 
 `maxFileBytes` is measured on compressed bytes, checked after each record, and
 is not a hard limit: a record is never split across files, so a file grows to
@@ -77,13 +77,13 @@ a response started (HTTP 499); those lines carry the request only.
 
 A request line does not say which process served it or how that process was
 started, so on its own it cannot be used to reproduce an inference. Three
-records under `captureLog.trace` add that, and each is off by default.
+records under `trace.state` add that, and each is off by default.
 
 ```yaml
-captureLog:
+trace:
   enabled: true
-  dir: /var/log/llama-swap/captures
-  trace:
+  dir: /var/log/llama-swap/trace
+  state:
     backend: true
     config: true
     checkpoint: true
@@ -91,7 +91,7 @@ captureLog:
 
 **Turning any of these on writes the expanded `cmd`, the `env` and — for
 `checkpoint` — the whole effective configuration into the files.** That is
-what makes the log reproducible, and it is also why the switches exist
+what makes the trace reproducible, and it is also why the switches exist
 separately from `enabled`. Use `maskPaths` and `maskEnv` below before enabling
 them on a host whose configuration carries credentials.
 
@@ -116,7 +116,7 @@ The sink records what it has; `maskPaths` and `maskEnv` take parts back out.
 Both are empty by default, which masks nothing.
 
 ```yaml
-captureLog:
+trace:
   maskPaths:
     - backend.cmd
     - req.headers.Authorization

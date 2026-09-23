@@ -9,7 +9,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// The capture log records what it has and then takes things back out here.
+// The trace records what it has and then takes things back out here.
 // That order is deliberate: a sink that decides field by field what is worth
 // keeping cannot be used to reproduce a request, so the default (an empty
 // maskPaths and maskEnv) masks nothing and the configuration names the
@@ -27,10 +27,10 @@ import (
 //     A mask path naming a body is refused at startup rather than quietly
 //     ignored.
 
-// captureLogMask is the redaction configured for the sink. A nil *captureLogMask
+// traceMask is the redaction configured for the sink. A nil *traceMask
 // is the "nothing configured" case and every method tolerates it, so callers
 // never branch on it.
-type captureLogMask struct {
+type traceMask struct {
 	// paths are gjson/sjson paths, already filtered of anything that would
 	// reach a body.
 	paths []string
@@ -38,22 +38,22 @@ type captureLogMask struct {
 	env map[string]struct{}
 }
 
-// captureLogBodyPaths are the record fields a mask may never touch.
-var captureLogBodyPaths = []string{"req.body", "resp.body"}
+// traceBodyPaths are the record fields a mask may never touch.
+var traceBodyPaths = []string{"req.body", "resp.body"}
 
-// newCaptureLogMask compiles cfg's mask settings, reporting (once, at startup)
+// newTraceMask compiles cfg's mask settings, reporting (once, at startup)
 // every path it refuses. It returns nil when nothing is configured so the
 // common case costs nothing per record.
-func newCaptureLogMask(cfg config.CaptureLogConfig, logger *logmon.Monitor) *captureLogMask {
-	m := &captureLogMask{}
+func newTraceMask(cfg config.TraceConfig, logger *logmon.Monitor) *traceMask {
+	m := &traceMask{}
 	for _, path := range cfg.MaskPaths {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			continue
 		}
-		if reason, bad := captureLogMaskRefusal(path); bad {
+		if reason, bad := traceMaskRefusal(path); bad {
 			if logger != nil {
-				logger.Warnf("captureLog.maskPaths: ignoring %q: %s", path, reason)
+				logger.Warnf("trace.maskPaths: ignoring %q: %s", path, reason)
 			}
 			continue
 		}
@@ -75,11 +75,11 @@ func newCaptureLogMask(cfg config.CaptureLogConfig, logger *logmon.Monitor) *cap
 	return m
 }
 
-// captureLogMaskRefusal reports why a configured path cannot be applied. The
+// traceMaskRefusal reports why a configured path cannot be applied. The
 // two refusals are a body (verbatim by contract) and the object containing one,
 // since replacing that whole object takes the body with it.
-func captureLogMaskRefusal(path string) (string, bool) {
-	for _, body := range captureLogBodyPaths {
+func traceMaskRefusal(path string) (string, bool) {
+	for _, body := range traceBodyPaths {
 		if path == body || strings.HasPrefix(path, body+".") {
 			return "request and response bodies are kept verbatim and cannot be masked", true
 		}
@@ -98,7 +98,7 @@ func captureLogMaskRefusal(path string) (string, bool) {
 // every request record) and change what the absence of a field means.
 // Everything sjson does not touch is copied through byte for byte, which is
 // what keeps the bodies next to a masked field verbatim.
-func (m *captureLogMask) applyPaths(line []byte) []byte {
+func (m *traceMask) applyPaths(line []byte) []byte {
 	if m == nil || len(m.paths) == 0 {
 		return line
 	}
@@ -123,7 +123,7 @@ func (m *captureLogMask) applyPaths(line []byte) []byte {
 // An entry without "=" is a name with no value and is left alone. The input
 // slice is never modified: it belongs to the configuration and is shared with
 // everything else that reads it.
-func (m *captureLogMask) maskEnv(env []string) []string {
+func (m *traceMask) maskEnv(env []string) []string {
 	if len(env) == 0 {
 		return env
 	}
@@ -153,7 +153,7 @@ func (m *captureLogMask) maskEnv(env []string) []string {
 // names), so the walk is over map[string]any rather than over fields.
 //
 // It rewrites in place: the value is a private copy, decoded for this record.
-func (m *captureLogMask) maskEnvInValue(value any) {
+func (m *traceMask) maskEnvInValue(value any) {
 	if m == nil || len(m.env) == 0 {
 		return
 	}
@@ -177,7 +177,7 @@ func (m *captureLogMask) maskEnvInValue(value any) {
 
 // maskEnvList applies maskEnv to a decoded YAML list, leaving non-string
 // elements alone.
-func (m *captureLogMask) maskEnvList(list []any) []any {
+func (m *traceMask) maskEnvList(list []any) []any {
 	out := make([]any, len(list))
 	for i, entry := range list {
 		text, ok := entry.(string)

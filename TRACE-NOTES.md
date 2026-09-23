@@ -1,4 +1,4 @@
-# JSONL capture sink — implementation notes
+# JSONL trace sink — implementation notes
 
 2026-09-23。branch `feat/jsonl-capture-sink`（base = `d1c6429` "changelog: v257"、
 upstream の `e054c90a` の 1 commit 先。`e054c90a` は HEAD の祖先）。未 commit。
@@ -18,23 +18,23 @@ activity 行の挙動は変えていない（根拠は §4）。
 
 | ファイル | 変更 |
 |---|---|
-| `internal/server/capturelog.go` | 新規。sink 本体（writer goroutine・zstd ファイル・ローテーション・レコード組み立て・符号化） |
-| `internal/server/capturelog_test.go` | 新規。17 テスト（うち 2 本は 2 subtest） |
-| ~~`internal/server/capturelog_fifo_test.go`~~ | 第 2 版で削除（FIFO 出力の廃止に伴い） |
-| `internal/server/metrics.go` | `captureLog` フィールド／`attachCaptureLog`／`wantsRequestCapture`／`Close`／`record` 内の 5 箇所の emit／`successOutcome` |
+| `internal/server/trace.go` | 新規。sink 本体（writer goroutine・zstd ファイル・ローテーション・レコード組み立て・符号化） |
+| `internal/server/trace_test.go` | 新規。17 テスト（うち 2 本は 2 subtest） |
+| ~~`internal/server/trace_fifo_test.go`~~ | 第 2 版で削除（FIFO 出力の廃止に伴い） |
+| `internal/server/metrics.go` | `trace` フィールド／`attachTrace`／`wantsRequestCapture`／`Close`／`record` 内の 5 箇所の emit／`successOutcome` |
 | `internal/server/metrics_middleware.go` | 1 行。リクエスト本文の buffering 条件を `mm.enableCaptures` → `mm.wantsRequestCapture()` |
-| `internal/server/server.go` | `attachCaptureLog` の配線、`Server.Shutdown` から `metrics.Close()` |
-| `internal/config/config.go` | `CaptureLogConfig` と `Config.CaptureLog` |
-| `config-schema.json` | `captureLog` プロパティ |
-| `docs/config.example.yaml` | コメントアウトした `captureLog:` 例（`# store:` と同じ扱い） |
-| `docs/kb/guides/operations/observability-storage-and-activity.md` | `captureLog` の節と `config_keys` |
+| `internal/server/server.go` | `attachTrace` の配線、`Server.Shutdown` から `metrics.Close()` |
+| `internal/config/config.go` | `TraceConfig` と `Config.Trace` |
+| `config-schema.json` | `trace` プロパティ |
+| `docs/config.example.yaml` | コメントアウトした `trace:` 例（`# store:` と同じ扱い） |
+| `docs/kb/guides/operations/observability-storage-and-activity.md` | `trace` の節と `config_keys` |
 
 設定:
 
 ```yaml
-captureLog:
+trace:
   enabled: false                       # 既定 false
-  dir: /var/log/llama-swap/captures    # 出力先ディレクトリ（無ければ作る）
+  dir: /var/log/llama-swap/trace       # 出力先ディレクトリ（無ければ作る）
   maxFileBytes: 268435456              # 圧縮後がこれを超えたらローテーション（既定 256 MiB）
   level: 3                             # zstd レベル。省略時は klauspost の既定
   includeAborted: false                # 既定 false。true なら 499 も 1 行
@@ -45,7 +45,7 @@ captureLog:
 ### 2.1 emit する場所 — `storeCapture` の「中」ではなく「隣」
 
 指示書は「足す場所は `metrics.go:267` の `storeCapture`」だった。実装では
-`storeCapture` の呼び出しの直後（`record` 内）に `mp.writeCaptureLog(...)` を置いた。
+`storeCapture` の呼び出しの直後（`record` 内）に `mp.writeTrace(...)` を置いた。
 現在の行番号は `metrics.go:208`（499）・`:237`（非 200）・`:259`（本文が空）・
 `:282`（展開失敗）・`:336`（200）。理由は 3 つで、
 いずれも「封筒が揃うのは storeCapture の呼び出し地点であって storeCapture の中ではない」に帰着する。
@@ -65,7 +65,7 @@ blocking open、`O_NONBLOCK` を使わない理由、EPIPE の扱い）は**廃�
 現在の形は:
 
 - 設定は `dir`（ディレクトリ。無ければ `MkdirAll`）。ファイルは
-  `captures-<timestamp>.jsonl.zst`（timestamp は Go の `20060102T150405Z0700`）。
+  `trace-<timestamp>.jsonl.zst`（timestamp は Go の `20060102T150405Z0700`）。
   **名前は open した時点で確定し、rename しない。** 同じ秒に 2 本開く場合は
   `_001` …（ゼロ埋め）の接尾辞。`'_' > '.'` なので、**接尾辞なしの名前がその秒の先頭に来て、
   以後は連番順**に並ぶ＝ ls / glob の順序がそのまま書いた順序になる。open は `O_EXCL` なので
@@ -125,7 +125,7 @@ activity 行からは正常終了と区別できない。JSONL はここを区�
 （`swaputil.ClientContext`）。`MarkClientClosed` と同じ理由で、inflight tracker の
 「オペレータによるキャンセル」や peer router の shutdown による**サーバ側キャンセルを
 クライアント切断と誤認しない**ため。この区別は
-`TestCaptureLog_ServerSideCancelIsNotMidStream` で固定してある。
+`TestTrace_ServerSideCancelIsNotMidStream` で固定してある。
 
 ### 2.6 レコードの各フィールドの出どころ
 
@@ -180,17 +180,17 @@ JSONL にも本文を書かない。ただし黙って消さず、落ちたこ�
   `resp.body` は**展開前の生バイトを base64**。このときだけ `resp.headers` の
   `Content-Encoding` を**残す**（§2.7 と逆）。その行の body は展開後ではなく線を流れた形なので、
   `Content-Encoding` はまだそのバイトを正しく説明している。消費側が gunzip すべき対象は
-  まさにこれ。実装上は `captureLogEvent.respIsWire` が両方（base64 強制 + ヘッダ温存）を決める。
+  まさにこれ。実装上は `traceEvent.respIsWire` が両方（base64 強制 + ヘッダ温存）を決める。
 - **`outcome` は裁定文では `"ok"` だったが、実装は `successOutcome(r)` を通している。**
   通常は `ok` になる。クライアントが実際に途中で切れていた場合だけ
   `client_disconnected_mid_stream` になり、そこを `ok` と書くと §2.5 で塞いだ穴が
   この 2 経路から再び開く。裁定の趣旨（「エラーではなく成功として記録せよ」）は満たしている。
   **監督の確認事項**（§5-1）。
 
-### 2.9 `writeCaptureLog` の引数を struct にした
+### 2.9 `writeTrace` の引数を struct にした
 
 裁定 1・2 で `cf` と `respIsWire` が増え、位置引数が 9 個になるところだった
-（`reqBody` / `respBody` のように取り違えやすい同型引数が並ぶ）。`captureLogEvent` に畳んだ。
+（`reqBody` / `respBody` のように取り違えやすい同型引数が並ぶ）。`traceEvent` に畳んだ。
 `record` 側の呼び出しは 5 箇所とも複合リテラル。**呼び出しを足しただけで、
 `record` の既存の式・early return の条件は無変更**（§4-3 は維持）。
 
@@ -212,7 +212,7 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
   **最後のフレームを閉じられるのは Close だけ**なので、ここで打ち切る方が害が大きい。
 - Close されずにプロセスが死んだ場合は、最後のファイルがフレーム未終端（epilogue 無し）
   になる。レコードごとに flush しているので**そこまでのレコードは展開でき**、復号器は
-  末尾で unexpected EOF を報告する（`TestCaptureLog_UnclosedFileReadsToLastFlush`）。
+  末尾で unexpected EOF を報告する（`TestTrace_UnclosedFileReadsToLastFlush`）。
 - 書き込み失敗でリクエスト処理は壊れない。`write` は non-blocking（channel が満杯なら
   ドロップ + 警告）、ファイル write のエラーは 1 回だけ警告して続行。
   encode 失敗も警告して 1 行捨てるだけ。
@@ -222,15 +222,15 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
 1. **capture ring**: `addCapture` / `storeCapture` / `captureCache` / `compressCapture` を
    1 文字も触っていない。sink は `captureCache` を読みも書きもしない。
 2. **`/api/captures/{id}`**: `captures.go` は `ReqRespCapture` も含めて無変更。
-3. **メトリクス・activity 行**: `record` への変更は「`writeCaptureLog` の呼び出しを 5 箇所
+3. **メトリクス・activity 行**: `record` への変更は「`writeTrace` の呼び出しを 5 箇所
    足した」だけ（裁定 2 で 3 → 5）。`tm` を組み立てる式・`queueMetrics`・`emitMetric`・`cf` マスク・早期 return の
    条件はいずれも無変更（`git diff internal/server/metrics.go` で確認できる）。
 4. **middleware**: 変更は buffering 条件 1 行のみ
-   （`mm.enableCaptures` → `mm.wantsRequestCapture()` = `enableCaptures || captureLog != nil`）。
+   （`mm.enableCaptures` → `mm.wantsRequestCapture()` = `enableCaptures || trace != nil`）。
    sink が無効なら式は `mm.enableCaptures` と同値。**何を buffer するか（`cf` マスク）は無変更。**
    sink は `captureBuffer: 0` でも req body が要るので、この 1 行が必要だった。
-5. **既定値**: `CaptureLogConfig` の zero value は `enabled: false`。既存の設定ファイルの
-   挙動は変わらない。`TestCaptureLog_DisabledWritesNothing` で「ファイルすら作らない」ことと
+5. **既定値**: `TraceConfig` の zero value は `enabled: false`。既存の設定ファイルの
+   挙動は変わらない。`TestTrace_DisabledWritesNothing` で「ファイルすら作らない」ことと
    「activity 行は従来どおり 1 件入る」ことを固定してある。
 6. `go test ./...` / `go test -race ./internal/...` いずれも既存テストを含め全て pass。
 
@@ -268,7 +268,7 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
    既存の redaction をそのまま通しただけで、sink 側で足していない。
    ただし sink はリクエスト／レスポンス本文を全部保存するので、
    **ring より機微情報の露出面は明確に大きい**。出力先のパーミッションは運用側の責任。
-4. **`captureLog.enabled: true` かつ `dir: ""`（および `MkdirAll` の失敗）は起動エラーに
+4. **`trace.enabled: true` かつ `dir: ""`（および `MkdirAll` の失敗）は起動エラーに
    せず、警告を出して無効化**している（`load.go` の検証に手を入れると blast radius が
    広がるため）。起動時に落としたいなら `load.go` 側に移す。
 5. **`docs/` と `config-schema.json` にも手を入れた。** 指示書には無かったが、
@@ -276,46 +276,46 @@ gunzip しようとする。既存の `storeCapture` も同じ理由で落とし
    `config.example.yaml` と `config-schema.json` を更新せよ」と要求しているため。
    `config.example.yaml` へはコメントアウトした形で入れた（`# store:` と同じ扱い。
    `internal/docagent/golden_test.go` の section 一覧を触らずに済む）。不要なら落とせる。
-6. **queue 深さ 1024**（`captureLogQueueDepth`）と **既定閾値 256 MiB**
-   （`captureLogDefaultMaxFileBytes`）は根拠のある実測値ではなく、設計上の既定値。
-   第 1 版にあった `captureLogCloseTimeout`（3 秒）は第 2 版で削除した（§3）。
-7. **同一秒の連番は 3 桁ゼロ埋め**で、`captureLogMaxNameSeq = 1000` に達すると
+6. **queue 深さ 1024**（`traceQueueDepth`）と **既定閾値 256 MiB**
+   （`traceDefaultMaxFileBytes`）は根拠のある実測値ではなく、設計上の既定値。
+   第 1 版にあった `traceCloseTimeout`（3 秒）は第 2 版で削除した（§3）。
+7. **同一秒の連番は 3 桁ゼロ埋め**で、`traceMaxNameSeq = 1000` に達すると
    open がエラーになる（= sink が止まる）。桁が増えると名前が open 順に並ばなくなるため
    そこで切っている。1 秒に 1000 本ローテーションする設定は誤設定の域。
 
 ## 6. テスト
 
-`internal/server/capturelog_test.go`（17 本、うち 2 本は 2 subtest）。
+`internal/server/trace_test.go`（17 本、うち 2 本は 2 subtest）。
 指示書が求めた 6 本は以下:
 
 | 指示書の要求 | テスト |
 |---|---|
-| 200 非ストリームで本文がバイト単位一致 | `TestCaptureLog_SuccessIsByteExact` |
-| SSE で `data:` 行の全文 | `TestCaptureLog_StreamingKeepsWholeEventStream` |
-| 非 200 で `upstream_error` と本文 | `TestCaptureLog_UpstreamErrorKeepsResponseBody` |
-| `enabled: false` で何も書かれない | `TestCaptureLog_DisabledWritesNothing` |
-| 不正な UTF-8 が base64 に | `TestCaptureLog_InvalidUTF8IsBase64` |
-| 並行リクエストで行が混ざらない | `TestCaptureLog_ConcurrentRequestsDoNotInterleave` |
+| 200 非ストリームで本文がバイト単位一致 | `TestTrace_SuccessIsByteExact` |
+| SSE で `data:` 行の全文 | `TestTrace_StreamingKeepsWholeEventStream` |
+| 非 200 で `upstream_error` と本文 | `TestTrace_UpstreamErrorKeepsResponseBody` |
+| `enabled: false` で何も書かれない | `TestTrace_DisabledWritesNothing` |
+| 不正な UTF-8 が base64 に | `TestTrace_InvalidUTF8IsBase64` |
+| 並行リクエストで行が混ざらない | `TestTrace_ConcurrentRequestsDoNotInterleave` |
 
 並行テストは 24 並列・本文それぞれ 32 KiB で、行が混ざれば
 JSON の parse が壊れるか marker が食い違う形にしてある。
 
 追加した 4 本（指示書の要求ではないが、設計の要を固定するもの）:
 
-- `TestCaptureLog_MidStreamDisconnect` — 200 のまま切れた SSE が
+- `TestTrace_MidStreamDisconnect` — 200 のまま切れた SSE が
   `client_disconnected_mid_stream` になる（塞いだ穴そのもの）
-- `TestCaptureLog_ServerSideCancelIsNotMidStream` — サーバ側キャンセルは切断扱いしない
-- `TestCaptureLog_AbortedRequest`（2 subtest）— 499 は既定で出ない／
+- `TestTrace_ServerSideCancelIsNotMidStream` — サーバ側キャンセルは切断扱いしない
+- `TestTrace_AbortedRequest`（2 subtest）— 499 は既定で出ない／
   `includeAborted: true` で req のみ 1 行
-- `TestCaptureLog_RedactsSensitiveHeaders` — 既存の redaction を通っている
+- `TestTrace_RedactsSensitiveHeaders` — 既存の redaction を通っている
 
 裁定（2026-09-23）で追加した 3 本:
 
 | 裁定の要求 | テスト |
 |---|---|
-| `cf` で本文が落ちる経路で `body_omitted` と `body_bytes` | `TestCaptureLog_RoutePolicyOmitsBody`（2 subtest） |
-| 200 で本文が空のとき 1 行出る | `TestCaptureLog_EmptyResponseBodyStillEmitsLine` |
-| 展開失敗で生バイトが base64 | `TestCaptureLog_DecompressionFailureKeepsWireBytes` |
+| `cf` で本文が落ちる経路で `body_omitted` と `body_bytes` | `TestTrace_RoutePolicyOmitsBody`（2 subtest） |
+| 200 で本文が空のとき 1 行出る | `TestTrace_EmptyResponseBodyStillEmitsLine` |
+| 展開失敗で生バイトが base64 | `TestTrace_DecompressionFailureKeepsWireBytes` |
 
 - `RoutePolicyOmitsBody` は `captureFieldsFor(path)` を通して**実際のマスク表**を使う
   （`/v1/audio/speech` = resp 本文が落ちる／`/v1/audio/transcriptions` = req 本文が落ちる）。
@@ -327,25 +327,25 @@ JSON の parse が壊れるか marker が食い違う形にしてある。
   **`Content-Encoding: gzip` がヘッダに残っている**ことを見る（§2.8）。
 
 既存 11 本のうち body を読む箇所は、`Body` が `*string` になったのに伴い
-テスト側の `captureLogPayload.body()` ヘルパ経由に書き換えた（判定内容は不変）。
+テスト側の `tracePayload.body()` ヘルパ経由に書き換えた（判定内容は不変）。
 
 第 2 版（zstd ＋ ローテーション）で追加した 4 本:
 
 | 要求 | テスト |
 |---|---|
-| 閾値を小さくして複数ファイルが生成される／各ファイルが単独で展開できる／全ファイルを展開して連結したものが書き込んだレコード列とバイト一致／各行が JSON として妥当 | `TestCaptureLog_RotationKeepsEveryByte` |
-| リクエスト経路からもローテーションが起き、順序が保たれる | `TestCaptureLog_RotatesAcrossRequests` |
-| `Close()` されずに終わっても flush 済みレコードまで展開できる | `TestCaptureLog_UnclosedFileReadsToLastFlush` |
-| 同一秒でも名前が衝突せず、名前が open 順に並ぶ | `TestCaptureLog_NamesAreUniqueAndSorted` |
+| 閾値を小さくして複数ファイルが生成される／各ファイルが単独で展開できる／全ファイルを展開して連結したものが書き込んだレコード列とバイト一致／各行が JSON として妥当 | `TestTrace_RotationKeepsEveryByte` |
+| リクエスト経路からもローテーションが起き、順序が保たれる | `TestTrace_RotatesAcrossRequests` |
+| `Close()` されずに終わっても flush 済みレコードまで展開できる | `TestTrace_UnclosedFileReadsToLastFlush` |
+| 同一秒でも名前が衝突せず、名前が open 順に並ぶ | `TestTrace_NamesAreUniqueAndSorted` |
 
-- `RotationKeepsEveryByte` は `newCaptureLogWriter` に直接 4 KiB のランダム hex を
-  含むレコードを 24 本渡し（`captureLogQueueDepth` の 1024 より十分少ないのでドロップ 0 を
+- `RotationKeepsEveryByte` は `newTraceWriter` に直接 4 KiB のランダム hex を
+  含むレコードを 24 本渡し（`traceQueueDepth` の 1024 より十分少ないのでドロップ 0 を
   検査）、閾値 1 KiB で複数ファイルに割る。各ファイルは**その都度新しい `zstd.Decoder`**
   で開く（辞書も前のファイルも視界に無いので、自己完結でなければ失敗する）。
-- テスト側のヘルパ（`captureLogFiles` / `decodeCaptureLogFile` / `readCaptureLogBytes`）は
+- テスト側のヘルパ（`traceFiles` / `decodeTraceFile` / `readTraceBytes`）は
   「ディレクトリ内の全ファイルを名前順に展開して連結」を担い、既存 13 本はこの経路に
   載せ替えただけで判定内容は不変。
-- 第 2 版で削除: `capturelog_fifo_test.go`（`TestCaptureLog_FIFOTargetDoesNotBlock`）。
+- 第 2 版で削除: `trace_fifo_test.go`（`TestTrace_FIFOTargetDoesNotBlock`）。
 
 ### 6.1 外部オラクル（zstd CLI）での確認
 
@@ -353,8 +353,8 @@ Go の decoder だけでなく **zstd CLI 1.5.7（`nix shell nixpkgs#zstd`）** 
 一時テストで 12 本のファイル（閾値 1 KiB・level 3）を吐かせて:
 
 ```
-$ zstd -t captures-20260923T123819+0900.jsonl.zst
-captures-20260923T123819+0900.jsonl.zst: 8466 bytes
+$ zstd -t trace-20260923T123819+0900.jsonl.zst
+trace-20260923T123819+0900.jsonl.zst: 8466 bytes
 $ zstd -t *.zst
 12 files decompressed : 101595 bytes total
 $ zstd -dc *.zst > joined.jsonl
@@ -405,10 +405,10 @@ nix shell nixpkgs#go --command go run honnef.co/go/tools/cmd/staticcheck@latest 
 
 結果は **16 件、すべて上流由来**（`cmd/kubeswap` 3 / `cmd/vllm-wrapper` 2 /
 `internal/config/mcpprovider.go` 1 / `internal/perf` 9 / `internal/swaputil/http.go` 1）で、
-**capture sink が触った範囲（`internal/server/capturelog*.go` / `internal/config/config.go`）
+**trace sink が触った範囲（`internal/server/trace*.go` / `internal/config/config.go`）
 への指摘は 0 件**。上流由来の 16 件は直していない。
 
-## 9. 第 3 版（2026-09-23）— トレース・チェックポイント・マスク
+## 9. 第 3 版（2026-09-23）— 状態記録・チェックポイント・マスク
 
 第 2 版までの出口は**リクエストの記録しか持たなかった**ため、記録を見ても
 「どのバックエンドが、どの設定で答えたのか」が分からず、推論サーバの入出力を再現できなかった。
@@ -420,19 +420,19 @@ emit 位置**はいずれも無変更。
 
 | ファイル | 変更 |
 |---|---|
-| `internal/server/capturelog.go` | `type` / `v` の導入、`request` レコードに `method` / `remote_ip` / クエリ込み `path`、writer への `mask` / `checkpoint` フック |
-| `internal/server/capturelogmask.go` | 新規。マスク機構（`maskPaths` の sjson 適用、`maskEnv` の名前指定、本文パスの拒否） |
-| `internal/server/capturelogtrace.go` | 新規。イベントバス購読・スナップショット・チェックポイント描画・Server 側の状態 seam |
-| `internal/server/capturelogtrace_test.go` | 新規。14 テスト |
-| `internal/server/capturelog_test.go` | ヘルパ 2 箇所の署名追従のみ |
-| `internal/server/metrics.go` | `captureLogTrace` フィールド、`attachCaptureLog` の組み立て順、`Close` で購読解除 |
-| `internal/server/server.go` | 1 行（`attachCaptureLog` に `s.captureLogState` を渡す） |
-| `internal/config/config.go` | `CaptureLogTraceConfig`、`MaskPaths`、`MaskEnv` |
+| `internal/server/trace.go` | `type` / `v` の導入、`request` レコードに `method` / `remote_ip` / クエリ込み `path`、writer への `mask` / `checkpoint` フック |
+| `internal/server/tracemask.go` | 新規。マスク機構（`maskPaths` の sjson 適用、`maskEnv` の名前指定、本文パスの拒否） |
+| `internal/server/tracestate.go` | 新規。イベントバス購読・スナップショット・チェックポイント描画・Server 側の状態 seam |
+| `internal/server/tracestate_test.go` | 新規。14 テスト |
+| `internal/server/trace_test.go` | ヘルパ 2 箇所の署名追従のみ |
+| `internal/server/metrics.go` | `traceState` フィールド、`attachTrace` の組み立て順、`Close` で購読解除 |
+| `internal/server/server.go` | 1 行（`attachTrace` に `s.traceState` を渡す） |
+| `internal/config/config.go` | `TraceStateConfig`、`MaskPaths`、`MaskEnv` |
 | `config-schema.json` / `docs/config.example.yaml` / `docs/kb/guides/operations/observability-storage-and-activity.md` | 新設定の説明（機密が入ること・マスクの案内・fail-open と本文非対象の明記） |
 
 ### 9.2 レコードの種別と形式版
 
-全レコードの先頭に `"type"` と `"v"`（`captureLogFormatVersion = 1`）を置いた。
+全レコードの先頭に `"type"` と `"v"`（`traceFormatVersion = 1`）を置いた。
 種別は `request` / `backend` / `config` / `checkpoint`。
 `backend` / `config` / `checkpoint` は**ペイロードを種別名のキーの下に入れ子**にしてある
 （`{"type":"backend", …, "backend":{…}}`）。マスクのパスが
@@ -460,19 +460,19 @@ emit 位置**はいずれも無変更。
 
 要求は「writer goroutine をプロセス管理の取得でブロックさせない」。取った形:
 
-- `captureLogStateFunc`（構築時に渡す）が唯一の窓口。`Server.captureLogState` が実装で、
+- `traceStateFunc`（構築時に渡す）が唯一の窓口。`Server.traceState` が実装で、
   `s.local.RunningModels()`・`s.ActiveProfile()`・`yaml.Marshal(s.cfg)` を読む。
 - **呼ぶのは tracer の goroutine だけ**（構築時と各イベント配送時）。結果は
-  `atomic.Pointer[captureLogSnapshot]` に publish する。
+  `atomic.Pointer[traceSnapshot]` に publish する。
 - writer goroutine が呼ぶ `checkpointLine(now)` は**この atomic を load して整形するだけ**。
   ルータのロックにも、起動中のプロセスにも触らない。実効設定の JSON 化は
   `sync.OnceValues` で tracer 側に 1 回だけ寄せてある（設定は Server の生存期間中不変）。
 
 ### 9.6 順序は同じキューで保つ
 
-トレースはイベント経由で非同期に届くが、**`captureLogWriter.write` という同じ channel** に
+状態記録はイベント経由で非同期に届くが、**`traceWriter.write` という同じ channel** に
 入れる。別経路でファイルに直接書かせていない（単一 writer goroutine の所有を壊さないため）。
-`TestCaptureLog_TraceAndRequestsKeepOrder` が backend / request / config の並びを固定する。
+`TestTrace_StateAndRequestsKeepOrder` が backend / request / config の並びを固定する。
 
 チェックポイントだけは writer がファイルを開いた直後に**ファイルの 1 行目として**書く。
 サイズ閾値の判定はこのとき行わない（どのファイルも「前文 ＋ 最低 1 レコード」になる）。
@@ -492,7 +492,7 @@ emit 位置**はいずれも無変更。
 
 ### 9.8 状態記録は既定 false の個別スイッチ
 
-`captureLog.enabled` は出口全体の親スイッチのまま。そのうえで
-`captureLog.trace.backend` / `.config` / `.checkpoint` を**既定 false** で追加した。
+`trace.enabled` は出口全体の親スイッチのまま。そのうえで
+`trace.state.backend` / `.config` / `.checkpoint` を**既定 false** で追加した。
 `request` レコードへの `type` / `v` / `method` / 完全 `path` / `remote_ip` の追加は
 スイッチ無しで常に入る（機密ではないため）。

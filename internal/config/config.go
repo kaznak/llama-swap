@@ -120,15 +120,13 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
-// CaptureLogConfig configures the rotating, zstd-compressed JSONL
-// request/response sink. It is independent of captureBuffer: the sink is
-// write-only and never feeds the in-memory capture ring or
-// /api/captures/{id}.
-type CaptureLogConfig struct {
+// TraceConfig configures the rotating, zstd-compressed JSONL request/response
+// trace. It is a write-only sink: nothing reads it back.
+type TraceConfig struct {
 	// Enabled turns the sink on. Default false.
 	Enabled bool `yaml:"enabled" json:"enabled"`
 	// Dir is the directory the sink writes into, created if missing. Files are
-	// named captures-<timestamp>.jsonl.zst, and each one is a complete,
+	// named trace-<timestamp>.jsonl.zst, and each one is a complete,
 	// independently decompressible zstd stream. llama-swap never renames,
 	// reopens or deletes them.
 	Dir string `yaml:"dir" json:"dir"`
@@ -143,9 +141,9 @@ type CaptureLogConfig struct {
 	// Default false, matching the activity log, which records them but stores
 	// no capture (#1029).
 	IncludeAborted bool `yaml:"includeAborted" json:"includeAborted"`
-	// Trace opts into the state records. They are off by default because they
+	// State opts into the state records. They are off by default because they
 	// carry the expanded cmd, the env and the effective configuration.
-	Trace CaptureLogTraceConfig `yaml:"trace" json:"trace"`
+	State TraceStateConfig `yaml:"state" json:"state"`
 	// MaskPaths lists gjson/sjson paths whose value is replaced with
 	// RedactedPlaceholder in every record that has them. Empty (the default)
 	// masks nothing: the sink records what it has and this is the only thing
@@ -167,12 +165,12 @@ type CaptureLogConfig struct {
 	MaskEnv []string `yaml:"maskEnv" json:"maskEnv"`
 }
 
-// CaptureLogTraceConfig switches on the capture log's state records. Each one
-// is off by default: the capture log can be enabled for request traffic alone
-// without the expanded command lines, environments and effective
-// configuration these records carry. See CaptureLogConfig.MaskPaths and
-// MaskEnv for taking parts of them back out.
-type CaptureLogTraceConfig struct {
+// TraceStateConfig switches on the trace's state records. Each one is off by
+// default: the trace can be enabled for request traffic alone without the
+// expanded command lines, environments and effective configuration these
+// records carry. See TraceConfig.MaskPaths and MaskEnv for taking parts of
+// them back out.
+type TraceStateConfig struct {
 	// Backend writes one record per process state transition (starting,
 	// ready, stopping, stopped, shutdown), with that process's expanded cmd,
 	// env, resolved upstream and start time.
@@ -228,7 +226,7 @@ type Config struct {
 	LogToStdout        string            `yaml:"logToStdout"`
 	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
 	CaptureBuffer      int               `yaml:"captureBuffer"`
-	CaptureLog         CaptureLogConfig  `yaml:"captureLog"`
+	Trace              TraceConfig       `yaml:"trace"`
 	Store              *Store            `yaml:"store"`
 	UI                 UIConfig          `yaml:"ui"`
 	Performance        PerformanceConfig `yaml:"performance"`

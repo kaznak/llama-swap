@@ -22,11 +22,10 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
-// The capture log is a write-only JSONL sink: one self-contained line per
-// metered request, zstd-compressed into size-rotated files in a directory. It
-// exists next to the in-memory capture ring (captureBuffer,
-// /api/captures/{id}) and never feeds it: nothing here reads back, nothing
-// here changes what the ring, the activity row or the metrics record.
+// The trace is a write-only JSONL sink: one self-contained line per metered
+// request, zstd-compressed into size-rotated files in a directory. Nothing
+// reads it back, and nothing here changes what the in-memory capture ring,
+// the activity row or the metrics record.
 //
 // It deliberately records three things the ring cannot:
 //
@@ -39,44 +38,44 @@ import (
 //     deliberately keeps out of the ring.
 //
 // Requests alone do not say which backend answered them or how it was
-// configured, so the sink also carries state records (capturelogtrace.go): a
+// configured, so the sink also carries state records (tracestate.go): a
 // backend record per process state transition, a config record per hot-reload
 // boundary, and a checkpoint at the head of every file. They are opt-in
 // because they carry expanded command lines, environments and the effective
-// configuration; see config.CaptureLogTraceConfig.
+// configuration; see config.TraceStateConfig.
 
-// captureLogFormatVersion is the "v" every record carries. It is the version
+// traceFormatVersion is the "v" every record carries. It is the version
 // of the record format, not of llama-swap: a consumer reads it to know which
 // fields to expect. Bump it when a field's meaning changes.
-const captureLogFormatVersion = 1
+const traceFormatVersion = 1
 
 // The record kinds, carried in every record's leading "type". A consumer
 // dispatches on this before looking at anything else, and a kind it does not
 // know is a line it can skip whole.
 const (
-	captureLogTypeRequest    = "request"
-	captureLogTypeBackend    = "backend"
-	captureLogTypeConfig     = "config"
-	captureLogTypeCheckpoint = "checkpoint"
+	traceTypeRequest    = "request"
+	traceTypeBackend    = "backend"
+	traceTypeConfig     = "config"
+	traceTypeCheckpoint = "checkpoint"
 )
 
-// captureLogOutcome classifies how a metered request ended.
-type captureLogOutcome string
+// traceOutcome classifies how a metered request ended.
+type traceOutcome string
 
 const (
 	// outcomeOK is a 200 whose client stayed connected to the end.
-	outcomeOK captureLogOutcome = "ok"
+	outcomeOK traceOutcome = "ok"
 	// outcomeUpstreamError is any non-200, non-499 status.
-	outcomeUpstreamError captureLogOutcome = "upstream_error"
+	outcomeUpstreamError traceOutcome = "upstream_error"
 	// outcomeClientDisconnected is the 499 sentinel: the client went away
 	// before any response status was written.
-	outcomeClientDisconnected captureLogOutcome = "client_disconnected"
+	outcomeClientDisconnected traceOutcome = "client_disconnected"
 	// outcomeClientDisconnectedMidStream is a response that started (so the
 	// status is 200 and no 499 sentinel could be recorded) whose client
 	// connection was cancelled before the handler returned. This is the case
 	// an SSE stream cut short by the client lands in, and the one the
 	// activity row cannot distinguish from a normal completion.
-	outcomeClientDisconnectedMidStream captureLogOutcome = "client_disconnected_mid_stream"
+	outcomeClientDisconnectedMidStream traceOutcome = "client_disconnected_mid_stream"
 )
 
 const (
@@ -94,8 +93,8 @@ const (
 // cap, say — which is why this is a short identifier rather than a bool.
 const bodyOmittedRoutePolicy = "route_policy"
 
-// captureLogPayload is one half (request or response) of a log record.
-type captureLogPayload struct {
+// tracePayload is one half (request or response) of a log record.
+type tracePayload struct {
 	Headers map[string]string `json:"headers"`
 	// Body is the body verbatim: the exact bytes, never re-serialized JSON.
 	// Round-tripping through a JSON parser would reorder keys and normalize
@@ -113,7 +112,7 @@ type captureLogPayload struct {
 }
 
 // setBody records body verbatim, picking the encoding that preserves its bytes.
-func (p *captureLogPayload) setBody(body []byte) {
+func (p *tracePayload) setBody(body []byte) {
 	text, encoding := encodeBody(body)
 	p.Body = &text
 	p.BodyEncoding = encoding
@@ -122,7 +121,7 @@ func (p *captureLogPayload) setBody(body []byte) {
 // setWireBody records body as it arrived, without pretending it is text. It is
 // used for bytes llama-swap could not decode (a Content-Encoding it failed to
 // decompress): base64 is the only honest rendering of them.
-func (p *captureLogPayload) setWireBody(body []byte) {
+func (p *tracePayload) setWireBody(body []byte) {
 	text := base64.StdEncoding.EncodeToString(body)
 	p.Body = &text
 	p.BodyEncoding = bodyEncodingBase64
@@ -130,22 +129,22 @@ func (p *captureLogPayload) setWireBody(body []byte) {
 
 // omitBody records that a body existed but was not written, and how big it
 // was. size is nil when the size was never measured.
-func (p *captureLogPayload) omitBody(reason string, size *int) {
+func (p *tracePayload) omitBody(reason string, size *int) {
 	p.Body = nil
 	p.BodyEncoding = ""
 	p.BodyOmitted = reason
 	p.BodyBytes = size
 }
 
-// captureLogTokens is the token count joined in from the activity row.
-type captureLogTokens struct {
+// traceTokens is the token count joined in from the activity row.
+type traceTokens struct {
 	Input  int `json:"input"`
 	Output int `json:"output"`
 }
 
-// captureLogRecord is one JSONL line: the capture envelope joined with the
+// traceRecord is one JSONL line: the request/response envelope joined with the
 // activity row, so a consumer needs nothing else to interpret it.
-type captureLogRecord struct {
+type traceRecord struct {
 	Type string `json:"type"`
 	V    int    `json:"v"`
 	ID   int    `json:"id"`
@@ -155,44 +154,44 @@ type captureLogRecord struct {
 	// reproducible, and llama-swap rewrites the path in place (/v/… and
 	// /audioapi/… are stripped before dispatch), so this is the rewritten
 	// form rather than what the client typed.
-	Method         string            `json:"method"`
-	Path           string            `json:"path"`
-	RemoteIP       string            `json:"remote_ip"`
-	Outcome        captureLogOutcome `json:"outcome"`
-	RequestedModel string            `json:"requested_model"`
-	UsedModel      string            `json:"used_model"`
-	Status         int               `json:"status"`
-	DurationMs     int               `json:"duration_ms"`
-	Tokens         *captureLogTokens `json:"tokens"`
-	Error          *string           `json:"error"`
-	Req            captureLogPayload `json:"req"`
-	Resp           captureLogPayload `json:"resp"`
+	Method         string       `json:"method"`
+	Path           string       `json:"path"`
+	RemoteIP       string       `json:"remote_ip"`
+	Outcome        traceOutcome `json:"outcome"`
+	RequestedModel string       `json:"requested_model"`
+	UsedModel      string       `json:"used_model"`
+	Status         int          `json:"status"`
+	DurationMs     int          `json:"duration_ms"`
+	Tokens         *traceTokens `json:"tokens"`
+	Error          *string      `json:"error"`
+	Req            tracePayload `json:"req"`
+	Resp           tracePayload `json:"resp"`
 }
 
-// captureLogQueueDepth is how many encoded lines may wait for the writer
+// traceQueueDepth is how many encoded lines may wait for the writer
 // goroutine. It absorbs a burst while the writer is compressing or rotating;
 // beyond it lines are dropped rather than blocking a request.
-const captureLogQueueDepth = 1024
+const traceQueueDepth = 1024
 
-// captureLogDefaultMaxFileBytes is the rotation threshold used when the
+// traceDefaultMaxFileBytes is the rotation threshold used when the
 // configuration gives none: 256 MiB of compressed output.
-const captureLogDefaultMaxFileBytes int64 = 256 << 20
+const traceDefaultMaxFileBytes int64 = 256 << 20
 
-// captureLogFileTimeFormat stamps a file name with the local time the file was
+// traceFileTimeFormat stamps a file name with the local time the file was
 // opened. Basic ISO 8601, so the name needs no quoting in a shell.
-const captureLogFileTimeFormat = "20060102T150405Z0700"
+const traceFileTimeFormat = "20060102T150405Z0700"
 
 const (
-	captureLogFilePrefix = "captures-"
-	captureLogFileSuffix = ".jsonl.zst"
+	traceFilePrefix = "trace-"
+	traceFileSuffix = ".jsonl.zst"
 )
 
-// captureLogMaxNameSeq bounds the search for a free name within one second.
+// traceMaxNameSeq bounds the search for a free name within one second.
 // It is also the point at which the zero-padded suffix would grow a digit and
 // stop sorting in open order, and reaching it means more than a thousand files
 // were rotated inside one second, which is a misconfiguration rather than
 // something to spin on.
-const captureLogMaxNameSeq = 1000
+const traceMaxNameSeq = 1000
 
 // countingWriter counts the bytes that reach the file underneath the encoder.
 // The rotation threshold is measured on compressed output, and only the bytes
@@ -209,7 +208,7 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// captureLogFile is one output file: a zstd stream over a regular file, plus
+// traceFile is one output file: a zstd stream over a regular file, plus
 // the number of compressed bytes already in it.
 //
 // Each file is a complete, independent zstd stream. It gets its own encoder
@@ -217,14 +216,14 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // shared across files — no trained dictionary, no delta against the previous
 // file — so any one file decompresses on its own (`zstd -d <file>`) without
 // the rest of the directory being present.
-type captureLogFile struct {
+type traceFile struct {
 	name    string
 	f       *os.File
 	counter *countingWriter
 	enc     *zstd.Encoder
 }
 
-// openCaptureLogFile creates the next file in dir. The name is fixed when the
+// openTraceFile creates the next file in dir. The name is fixed when the
 // file is created and never changes: there is no "current" symlink and no
 // rename on rotation, so a copier that picks up a finished file is never
 // looking at a path whose meaning changed underneath it.
@@ -239,18 +238,18 @@ type captureLogFile struct {
 //
 // level is the zstd compression level in zstd(1)'s numbering; 0 means "not
 // configured" and leaves the klauspost default in place.
-func openCaptureLogFile(dir string, level int, now time.Time) (*captureLogFile, error) {
-	stamp := now.Format(captureLogFileTimeFormat)
+func openTraceFile(dir string, level int, now time.Time) (*traceFile, error) {
+	stamp := now.Format(traceFileTimeFormat)
 	var f *os.File
 	var name string
 	for seq := 0; ; seq++ {
-		if seq >= captureLogMaxNameSeq {
-			return nil, fmt.Errorf("no free name for %s%s* in %s", captureLogFilePrefix, stamp, dir)
+		if seq >= traceMaxNameSeq {
+			return nil, fmt.Errorf("no free name for %s%s* in %s", traceFilePrefix, stamp, dir)
 		}
 		if seq == 0 {
-			name = captureLogFilePrefix + stamp + captureLogFileSuffix
+			name = traceFilePrefix + stamp + traceFileSuffix
 		} else {
-			name = fmt.Sprintf("%s%s_%03d%s", captureLogFilePrefix, stamp, seq, captureLogFileSuffix)
+			name = fmt.Sprintf("%s%s_%03d%s", traceFilePrefix, stamp, seq, traceFileSuffix)
 		}
 		var err error
 		f, err = os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -277,7 +276,7 @@ func openCaptureLogFile(dir string, level int, now time.Time) (*captureLogFile, 
 		f.Close()
 		return nil, err
 	}
-	return &captureLogFile{name: name, f: f, counter: counter, enc: enc}, nil
+	return &traceFile{name: name, f: f, counter: counter, enc: enc}, nil
 }
 
 // write appends one encoded line and flushes it. The flush is per record on
@@ -286,7 +285,7 @@ func openCaptureLogFile(dir string, level int, now time.Time) (*captureLogFile, 
 // stays exact: an unflushed record would sit inside the encoder and make the
 // file look smaller than it is when the rotation threshold is tested. A record
 // is hundreds of kilobytes, so what a flush boundary costs in ratio is noise.
-func (c *captureLogFile) write(line []byte) error {
+func (c *traceFile) write(line []byte) error {
 	if _, err := c.enc.Write(line); err != nil {
 		return err
 	}
@@ -294,14 +293,14 @@ func (c *captureLogFile) write(line []byte) error {
 }
 
 // bytes is the compressed size on disk, counting everything flushed so far.
-func (c *captureLogFile) bytes() int64 {
+func (c *traceFile) bytes() int64 {
 	return c.counter.n
 }
 
 // close finishes the zstd frame and closes the file. Until this has run the
 // file is a truncated stream — readable up to the last flush, but without the
 // epilogue — which is why graceful shutdown has to reach it.
-func (c *captureLogFile) close() error {
+func (c *traceFile) close() error {
 	encErr := c.enc.Close()
 	fErr := c.f.Close()
 	if encErr != nil {
@@ -310,11 +309,11 @@ func (c *captureLogFile) close() error {
 	return fErr
 }
 
-// captureLogWriter appends encoded records to rotating files in dir. A single
+// traceWriter appends encoded records to rotating files in dir. A single
 // goroutine owns the open file and its encoder, which is what keeps concurrent
 // requests from interleaving: every line is handed over whole and written by
 // that one writer.
-type captureLogWriter struct {
+type traceWriter struct {
 	dir string
 	// maxFileBytes is the rotation threshold, tested on compressed bytes after
 	// a record is flushed. It is not a hard cap: records are never split, so a
@@ -326,13 +325,13 @@ type captureLogWriter struct {
 
 	// mask is the redaction applied to every line the sink encodes. It is nil
 	// when nothing is configured, and its methods tolerate that.
-	mask *captureLogMask
+	mask *traceMask
 
 	// checkpoint renders the state dump that goes at the head of a file, or
 	// returns nil when checkpoints are off. It is called by the writer
 	// goroutine immediately after a file is opened, so it must not reach into
 	// process management: the tracer keeps a snapshot up to date on its own
-	// goroutine and this only formats it (see capturelogtrace.go).
+	// goroutine and this only formats it (see tracestate.go).
 	checkpoint func(time.Time) []byte
 
 	lines chan []byte
@@ -349,7 +348,7 @@ type captureLogWriter struct {
 	warned atomic.Bool
 }
 
-// newCaptureLogWriter starts a capture log writer, or returns nil when the
+// newTraceWriter starts a trace writer, or returns nil when the
 // sink is disabled or misconfigured (an enabled sink with no directory, or a
 // directory that cannot be created, is a configuration mistake; it is reported
 // and disabled rather than failing startup, since the sink is an
@@ -360,30 +359,30 @@ type captureLogWriter struct {
 // goroutine, so an enabled sink that never sees a request leaves no empty
 // stream behind.
 //
-// mask and checkpoint come from attachCaptureLog: the first is shared with
-// the trace records so one configuration covers every line, the second is nil
-// unless captureLog.trace.checkpoint is on.
-func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor, mask *captureLogMask, checkpoint func(time.Time) []byte) *captureLogWriter {
+// mask and checkpoint come from attachTrace: the first is shared with the
+// state records so one configuration covers every line, the second is nil
+// unless trace.state.checkpoint is on.
+func newTraceWriter(cfg config.TraceConfig, logger *logmon.Monitor, mask *traceMask, checkpoint func(time.Time) []byte) *traceWriter {
 	if !cfg.Enabled {
 		return nil
 	}
 	if cfg.Dir == "" {
 		if logger != nil {
-			logger.Warn("captureLog.enabled is set but captureLog.dir is empty; capture log disabled")
+			logger.Warn("trace.enabled is set but trace.dir is empty; trace disabled")
 		}
 		return nil
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		if logger != nil {
-			logger.Warnf("capture log %s: creating the directory failed: %v; capture log disabled", cfg.Dir, err)
+			logger.Warnf("trace %s: creating the directory failed: %v; trace disabled", cfg.Dir, err)
 		}
 		return nil
 	}
 	maxFileBytes := cfg.MaxFileBytes
 	if maxFileBytes <= 0 {
-		maxFileBytes = captureLogDefaultMaxFileBytes
+		maxFileBytes = traceDefaultMaxFileBytes
 	}
-	w := &captureLogWriter{
+	w := &traceWriter{
 		dir:            cfg.Dir,
 		maxFileBytes:   maxFileBytes,
 		level:          cfg.Level,
@@ -391,7 +390,7 @@ func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor, ma
 		logger:         logger,
 		mask:           mask,
 		checkpoint:     checkpoint,
-		lines:          make(chan []byte, captureLogQueueDepth),
+		lines:          make(chan []byte, traceQueueDepth),
 		quit:           make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -399,7 +398,7 @@ func newCaptureLogWriter(cfg config.CaptureLogConfig, logger *logmon.Monitor, ma
 	return w
 }
 
-func (w *captureLogWriter) warnf(format string, args ...any) {
+func (w *traceWriter) warnf(format string, args ...any) {
 	if w.logger != nil {
 		w.logger.Warnf(format, args...)
 	}
@@ -407,7 +406,7 @@ func (w *captureLogWriter) warnf(format string, args ...any) {
 
 // write hands an encoded line to the writer goroutine. It never blocks and
 // never fails a request: a sink that cannot keep up drops lines and says so.
-func (w *captureLogWriter) write(line []byte) {
+func (w *traceWriter) write(line []byte) {
 	if w == nil {
 		return
 	}
@@ -416,7 +415,7 @@ func (w *captureLogWriter) write(line []byte) {
 	case <-w.quit:
 	default:
 		if n := w.dropped.Add(1); n == 1 || n%1000 == 0 {
-			w.warnf("capture log %s: queue full, dropped %d record(s)", w.dir, n)
+			w.warnf("trace %s: queue full, dropped %d record(s)", w.dir, n)
 		}
 	}
 }
@@ -426,7 +425,7 @@ func (w *captureLogWriter) write(line []byte) {
 // closing the frame is the only thing that turns the newest file into a
 // complete stream, and the writer never blocks on anything but writes to a
 // regular file.
-func (w *captureLogWriter) Close() error {
+func (w *traceWriter) Close() error {
 	if w == nil {
 		return nil
 	}
@@ -448,10 +447,10 @@ func (w *captureLogWriter) Close() error {
 // finished file is finished, which is what makes it safe for an external
 // copier to pick up. Deletion of old files is deliberately not implemented —
 // retention belongs to whatever copies them away.
-func (w *captureLogWriter) run() {
+func (w *traceWriter) run() {
 	defer close(w.done)
 
-	var cur *captureLogFile
+	var cur *traceFile
 	// broken latches when a file cannot be opened at all. The loop keeps
 	// draining afterwards so write() stays non-blocking and the queue does not
 	// pin dropped records in memory, but nothing is retried: a directory that
@@ -461,7 +460,7 @@ func (w *captureLogWriter) run() {
 	defer func() {
 		if cur != nil {
 			if err := cur.close(); err != nil {
-				w.warnf("capture log %s: closing %s failed: %v", w.dir, cur.name, err)
+				w.warnf("trace %s: closing %s failed: %v", w.dir, cur.name, err)
 			}
 		}
 	}()
@@ -472,9 +471,9 @@ func (w *captureLogWriter) run() {
 		}
 		if cur == nil {
 			now := time.Now()
-			f, err := openCaptureLogFile(w.dir, w.level, now)
+			f, err := openTraceFile(w.dir, w.level, now)
 			if err != nil {
-				w.warnf("capture log %s: open failed: %v; capture log disabled for this run", w.dir, err)
+				w.warnf("trace %s: open failed: %v; trace disabled for this run", w.dir, err)
 				broken = true
 				return
 			}
@@ -482,24 +481,24 @@ func (w *captureLogWriter) run() {
 			// The checkpoint is the file's first line, written before the
 			// record that caused the file to be opened. Rotation otherwise
 			// leaves a file that cannot be read without the ones before it:
-			// the trace records that say which backend is running and under
+			// the state records that say which backend is running and under
 			// which configuration are all in an earlier file. The size
 			// threshold is deliberately not tested here — a file always gets
 			// its preamble plus at least one record.
 			if w.checkpoint != nil {
 				if cp := w.checkpoint(now); cp != nil {
 					if err := cur.write(cp); err != nil && w.warned.CompareAndSwap(false, true) {
-						w.warnf("capture log %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
+						w.warnf("trace %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
 					}
 				}
 			}
 		}
 		if err := cur.write(line); err != nil && w.warned.CompareAndSwap(false, true) {
-			w.warnf("capture log %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
+			w.warnf("trace %s: writing %s failed: %v; further write errors are not reported", w.dir, cur.name, err)
 		}
 		if cur.bytes() >= w.maxFileBytes {
 			if err := cur.close(); err != nil {
-				w.warnf("capture log %s: closing %s failed: %v", w.dir, cur.name, err)
+				w.warnf("trace %s: closing %s failed: %v", w.dir, cur.name, err)
 			}
 			cur = nil
 		}
@@ -523,12 +522,12 @@ func (w *captureLogWriter) run() {
 	}
 }
 
-// captureLogEvent is everything the sink needs to know about one finished
+// traceEvent is everything the sink needs to know about one finished
 // request. It is a struct rather than a parameter list because the pieces come
 // from four different places (the activity row, the request, the recorder and
 // record()'s local decoding) and several are easy to swap by accident.
-type captureLogEvent struct {
-	outcome  captureLogOutcome
+type traceEvent struct {
+	outcome  traceOutcome
 	tm       ActivityLogEntry
 	r        *http.Request
 	recorder *responseBodyCopier
@@ -549,28 +548,28 @@ type captureLogEvent struct {
 	respIsWire bool
 }
 
-// writeCaptureLog joins the capture envelope with the activity row and queues
-// one JSONL line. It is called next to storeCapture, where every piece exists
-// at once, but is deliberately not called from inside it: storeCapture returns
+// writeTrace joins the request/response envelope with the activity row and
+// queues one JSONL line. It is called next to storeCapture, where every piece
+// exists at once, but is deliberately not called from inside it: storeCapture returns
 // early when captureBuffer is 0, does not see the activity row that carries
 // the timestamp, model and tokens, and is handed a nil body on the failure
 // path whose response the sink is supposed to keep.
 //
 // It never fails a request: encoding errors are logged and the line dropped.
-func (mp *metricsMonitor) writeCaptureLog(ev captureLogEvent) {
-	if mp.captureLog == nil {
+func (mp *metricsMonitor) writeTrace(ev traceEvent) {
+	if mp.trace == nil {
 		return
 	}
-	if ev.outcome == outcomeClientDisconnected && !mp.captureLog.includeAborted {
+	if ev.outcome == outcomeClientDisconnected && !mp.trace.includeAborted {
 		return
 	}
 
 	tm := ev.tm
-	rec := captureLogRecord{
-		Type:       captureLogTypeRequest,
-		V:          captureLogFormatVersion,
+	rec := traceRecord{
+		Type:       traceTypeRequest,
+		V:          traceFormatVersion,
 		ID:         tm.ID,
-		TS:         tm.Timestamp.Format(captureLogTimeFormat),
+		TS:         tm.Timestamp.Format(traceTimeFormat),
 		Method:     requestMethod(ev.r),
 		Path:       requestTarget(ev.r, tm.ReqPath),
 		RemoteIP:   requestRemoteIP(ev.r),
@@ -590,13 +589,13 @@ func (mp *metricsMonitor) writeCaptureLog(ev captureLogEvent) {
 	// would be a zero value masquerading as a measurement. null says "not
 	// measured"; {"input":0,"output":0} says "measured as zero".
 	if ev.outcome == outcomeOK || ev.outcome == outcomeClientDisconnectedMidStream {
-		rec.Tokens = &captureLogTokens{
+		rec.Tokens = &traceTokens{
 			Input:  tm.Tokens.InputTokens,
 			Output: tm.Tokens.OutputTokens,
 		}
 	}
 
-	rec.Req.Headers = captureLogHeaders(ev.reqHeaders)
+	rec.Req.Headers = traceHeaders(ev.reqHeaders)
 	if ev.cf&captureReqBody != 0 {
 		rec.Req.setBody(ev.reqBody)
 	} else {
@@ -629,12 +628,12 @@ func (mp *metricsMonitor) writeCaptureLog(ev captureLogEvent) {
 		}
 	}
 
-	line, err := encodeCaptureLogRecord(&rec)
+	line, err := encodeTraceRecord(&rec)
 	if err != nil {
-		mp.warnf("capture log: encoding record %d failed: %v", tm.ID, err)
+		mp.warnf("trace: encoding record %d failed: %v", tm.ID, err)
 		return
 	}
-	mp.captureLog.write(mp.captureLog.mask.applyPaths(line))
+	mp.trace.write(mp.trace.mask.applyPaths(line))
 }
 
 // requestMethod, requestTarget and requestRemoteIP read the request line off
@@ -682,12 +681,12 @@ func declaredRequestLength(r *http.Request) *int {
 	return &n
 }
 
-// captureLogTimeFormat is RFC 3339 with milliseconds and the local offset.
-const captureLogTimeFormat = "2006-01-02T15:04:05.000Z07:00"
+// traceTimeFormat is RFC 3339 with milliseconds and the local offset.
+const traceTimeFormat = "2006-01-02T15:04:05.000Z07:00"
 
-// captureLogHeaders normalizes a possibly nil header map so the record always
+// traceHeaders normalizes a possibly nil header map so the record always
 // carries an object rather than null.
-func captureLogHeaders(h map[string]string) map[string]string {
+func traceHeaders(h map[string]string) map[string]string {
 	if h == nil {
 		return map[string]string{}
 	}
@@ -706,10 +705,10 @@ func encodeBody(body []byte) (string, string) {
 	return base64.StdEncoding.EncodeToString(body), bodyEncodingBase64
 }
 
-// encodeCaptureLogRecord renders rec as one JSONL line (trailing newline
+// encodeTraceRecord renders rec as one JSONL line (trailing newline
 // included). HTML escaping is off so bodies read as they were sent; the bytes
 // still round-trip exactly either way.
-func encodeCaptureLogRecord(rec any) ([]byte, error) {
+func encodeTraceRecord(rec any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
